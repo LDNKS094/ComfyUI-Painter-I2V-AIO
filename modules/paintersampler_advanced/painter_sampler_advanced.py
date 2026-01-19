@@ -5,6 +5,7 @@ import comfy.model_management
 import comfy.utils
 import latent_preview
 import logging
+from comfy_api.latest import io
 
 logger = logging.getLogger("Comfyui-PainterSamplerAdvanced")
 
@@ -65,7 +66,7 @@ def common_ksampler(
     return out
 
 
-class PainterSamplerAdvanced:
+class PainterSamplerAdvanced(io.ComfyNode):
     """
     Advanced Dual-Model Tandem Sampler with separate conditioning for high/low noise phases.
 
@@ -77,60 +78,55 @@ class PainterSamplerAdvanced:
     """
 
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "high_model": ("MODEL",),
-                "low_model": ("MODEL",),
-                "add_noise": (["enable", "disable"], {"default": "enable"}),
-                "noise_seed": (
-                    "INT",
-                    {
-                        "default": 0,
-                        "min": 0,
-                        "max": 0xFFFFFFFFFFFFFFFF,
-                        "control_after_generate": True,
-                    },
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="PainterSamplerAdvanced",
+            display_name="Painter Sampler Advanced",
+            category="sampling/painter",
+            inputs=[
+                io.Model.Input("high_model"),
+                io.Model.Input("low_model"),
+                io.Combo.Input(
+                    "add_noise", options=["enable", "disable"], default="enable"
                 ),
-                "steps": ("INT", {"default": 20, "min": 1, "max": 10000}),
-                "high_cfg": (
-                    "FLOAT",
-                    {"default": 8.0, "min": 0.0, "max": 100.0, "step": 0.01},
+                io.Int.Input(
+                    "noise_seed",
+                    default=0,
+                    min=0,
+                    max=0xFFFFFFFFFFFFFFFF,
+                    control_after_generate=True,
                 ),
-                "low_cfg": (
-                    "FLOAT",
-                    {"default": 8.0, "min": 0.0, "max": 100.0, "step": 0.01},
+                io.Int.Input("steps", default=20, min=1, max=10000),
+                io.Float.Input("high_cfg", default=8.0, min=0.0, max=100.0, step=0.01),
+                io.Float.Input("low_cfg", default=8.0, min=0.0, max=100.0, step=0.01),
+                io.Combo.Input(
+                    "sampler_name", options=comfy.samplers.KSampler.SAMPLERS
                 ),
-                "sampler_name": (comfy.samplers.KSampler.SAMPLERS,),
-                "scheduler": (comfy.samplers.KSampler.SCHEDULERS,),
+                io.Combo.Input("scheduler", options=comfy.samplers.KSampler.SCHEDULERS),
                 # 高噪声阶段 conditioning
-                "high_positive": ("CONDITIONING",),
-                "high_negative": ("CONDITIONING",),
+                io.Conditioning.Input("high_positive"),
+                io.Conditioning.Input("high_negative"),
                 # 低噪声阶段 conditioning
-                "low_positive": ("CONDITIONING",),
-                "low_negative": ("CONDITIONING",),
-                "latent_image": ("LATENT",),
-                "start_at_step": ("INT", {"default": 0, "min": 0, "max": 10000}),
-                "switch_at_step": ("INT", {"default": 2, "min": 1, "max": 10000}),
-                "end_at_step": ("INT", {"default": 10000, "min": 0, "max": 10000}),
-                "return_leftover_noise": (
-                    ["disable", "enable"],
-                    {"default": "disable"},
+                io.Conditioning.Input("low_positive"),
+                io.Conditioning.Input("low_negative"),
+                io.Latent.Input("latent_image"),
+                io.Int.Input("start_at_step", default=0, min=0, max=10000),
+                io.Int.Input("switch_at_step", default=2, min=1, max=10000),
+                io.Int.Input("end_at_step", default=10000, min=0, max=10000),
+                io.Combo.Input(
+                    "return_leftover_noise",
+                    options=["disable", "enable"],
+                    default="disable",
                 ),
-            }
-        }
+            ],
+            outputs=[
+                io.Latent.Output(display_name="latent"),
+            ],
+        )
 
-    RETURN_TYPES = ("LATENT",)
-    RETURN_NAMES = ("latent",)
-    FUNCTION = "sample"
-    CATEGORY = "sampling/painter"
-
-    OUTPUT_NODE = False
-    ICON = "KSampler"
-    WIDTH = 210
-
-    def sample(
-        self,
+    @classmethod
+    def execute(
+        cls,
         high_model,
         low_model,
         add_noise,
@@ -149,7 +145,7 @@ class PainterSamplerAdvanced:
         switch_at_step,
         end_at_step,
         return_leftover_noise,
-    ):
+    ) -> io.NodeOutput:
         # 参数标准化
         start_at_step = max(0, start_at_step)
         end_at_step = min(steps, max(start_at_step + 2, end_at_step))
@@ -216,8 +212,4 @@ class PainterSamplerAdvanced:
             disable_pbar=disable_pbar,
         )
 
-        return (samples_final,)
-
-
-NODE_CLASS_MAPPINGS = {"PainterSamplerAdvanced": PainterSamplerAdvanced}
-NODE_DISPLAY_NAME_MAPPINGS = {"PainterSamplerAdvanced": "Painter Sampler Advanced"}
+        return io.NodeOutput(samples_final)

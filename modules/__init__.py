@@ -5,42 +5,21 @@ PainterAIO Modules
 All node modules are organized here for easy management and upstream sync.
 """
 
-from .wan22fmlf import (
-    WanFirstMiddleLastFrameToVideo,
-    WanMultiFrameRefToVideo,
-    WanMultiImageLoader,
-    WanFourFrameReferenceUltimate,
-    WanAdvancedI2V,
-    WanAdvancedExtractLastFrames,
-    WanAdvancedExtractLastImages,
-)
-
 from .painteri2v import PainterI2V
+from .painteri2v_extend import PainterI2VExtend
 from .painteri2v_advanced import PainterI2VAdvanced
 from .paintersampler import PainterSampler
 from .paintersampler_advanced import PainterSamplerAdvanced
-from .painterflf2v import PainterFLF2V
-from .painterlongvideo import PainterLongVideo
 
 __all__ = [
-    # wan22fmlf
-    "WanFirstMiddleLastFrameToVideo",
-    "WanMultiFrameRefToVideo",
-    "WanMultiImageLoader",
-    "WanFourFrameReferenceUltimate",
-    "WanAdvancedI2V",
-    "WanAdvancedExtractLastFrames",
-    "WanAdvancedExtractLastImages",
-    # painteri2v
+    # painteri2v (T2V/I2V/FLF2V unified)
     "PainterI2V",
-    # painteri2v_advanced
+    # painteri2v_extend (video continuation)
+    "PainterI2VExtend",
+    # painteri2v_advanced (full control, 4 cond output)
     "PainterI2VAdvanced",
     # paintersampler
     "PainterSampler",
     # paintersampler_advanced
     "PainterSamplerAdvanced",
-    # painterflf2v
-    "PainterFLF2V",
-    # painterlongvideo
-    "PainterLongVideo",
 ]

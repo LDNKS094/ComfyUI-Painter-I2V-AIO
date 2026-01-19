@@ -39,6 +39,7 @@ class PainterI2VExtend(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(
             node_id="PainterI2VExtend",
+            display_name="Painter I2V Extend",
             category="conditioning/video_models",
             inputs=[
                 io.Conditioning.Input("positive"),

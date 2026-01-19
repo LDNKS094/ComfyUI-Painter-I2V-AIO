@@ -33,9 +33,10 @@ class PainterI2V(io.ComfyNode):
     """
 
     @classmethod
-    def define_schema(cls):
+    def define_schema(cls) -> io.Schema:
         return io.Schema(
             node_id="PainterI2V",
+            display_name="Painter I2V",
             category="conditioning/video_models",
             inputs=[
                 io.Conditioning.Input("positive"),
