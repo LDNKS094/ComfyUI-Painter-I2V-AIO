@@ -10,6 +10,7 @@ from ..common.utils import (
     apply_frequency_separation,
     extract_reference_motion,
     merge_clip_vision_outputs,
+    apply_clip_vision,
     get_svi_padding_latent,
 )
 
@@ -169,9 +170,10 @@ class PainterI2V(io.ComfyNode):
                 )
 
         # Handle CLIP Vision outputs
-        positive, negative = cls._apply_clip_vision(
-            positive, negative, clip_vision_start, clip_vision_end
+        clip_vision_output = merge_clip_vision_outputs(
+            clip_vision_start, clip_vision_end
         )
+        positive, negative = apply_clip_vision(clip_vision_output, positive, negative)
 
         # Handle reference_video → reference_motion
         if reference_video is not None:
@@ -381,24 +383,6 @@ class PainterI2V(io.ComfyNode):
                 negative,
                 {"reference_latents": [torch.zeros_like(ref_latent)]},
                 append=True,
-            )
-
-        return positive, negative
-
-    @classmethod
-    def _apply_clip_vision(cls, positive, negative, clip_vision_start, clip_vision_end):
-        """Apply CLIP vision conditioning with optional dual-clip concatenation"""
-
-        clip_vision_output = merge_clip_vision_outputs(
-            clip_vision_start, clip_vision_end
-        )
-
-        if clip_vision_output is not None:
-            positive = node_helpers.conditioning_set_values(
-                positive, {"clip_vision_output": clip_vision_output}
-            )
-            negative = node_helpers.conditioning_set_values(
-                negative, {"clip_vision_output": clip_vision_output}
             )
 
         return positive, negative

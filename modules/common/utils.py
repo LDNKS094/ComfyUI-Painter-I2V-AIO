@@ -257,6 +257,33 @@ def merge_clip_vision_outputs(*outputs):
     return merged
 
 
+def apply_clip_vision(clip_vision_output, *conditionings):
+    """
+    Apply CLIP vision output to multiple conditioning tensors.
+
+    Args:
+        clip_vision_output: CLIP vision output object (can be None)
+        *conditionings: Conditioning tensors to apply CLIP vision to
+
+    Returns:
+        Tuple of modified conditioning tensors (same order as input)
+    """
+    import node_helpers
+
+    if clip_vision_output is None:
+        return conditionings if len(conditionings) > 1 else conditionings[0]
+
+    results = []
+    for cond in conditionings:
+        results.append(
+            node_helpers.conditioning_set_values(
+                cond, {"clip_vision_output": clip_vision_output}
+            )
+        )
+
+    return tuple(results) if len(results) > 1 else results[0]
+
+
 def get_svi_padding_latent(
     batch_size: int,
     latent_channels: int,

@@ -131,7 +131,9 @@ if reference_video is not None:
 
 ### 两个核心机制
 
-#### 1. 动作接续（motion_frames）
+#### 1. 动作接续（motion_frames）— AUTO_CONTINUE 模式
+
+> 借鉴 Wan22FMLF 的 AUTO_CONTINUE 模式，使用 IMAGE 空间操作
 
 ```
 previous_video[-motion_frames:] → 填入输出序列开头 → mask=0 硬锁定
@@ -140,7 +142,29 @@ previous_video[-motion_frames:] → 填入输出序列开头 → mask=0 硬锁�
 - 目的：保证动作在接续点平滑过渡
 - 输出包含这些重叠帧
 - 实际新生成帧数 = length - motion_frames
-- 后处理可裁剪重叠帧
+- 后处理可裁剪重叠帧（使用 KJNodes ImageBatchExtendWithOverlap 等）
+- **高噪/低噪阶段使用相同 conditioning**（与 SVI 模式的关键区别）
+
+**实现逻辑**：
+```python
+# 1. 从 previous_video 提取最后 motion_frames 帧
+overlap_frames = previous_video[-motion_frames:]
+
+# 2. 填入输出序列开头
+image = torch.ones((length, height, width, 3), device=device) * 0.5
+image[:motion_frames] = overlap_frames
+
+# 3. 其余帧填充（如 end_image）
+if end_image is not None:
+    image[-1:] = end_image
+
+# 4. VAE 编码
+concat_latent_image = vae.encode(image)
+
+# 5. 创建 mask，锁定 motion_frames 区域
+motion_latent_frames = ((motion_frames - 1) // 4) + 1
+mask[:, :, :motion_latent_frames * 4] = 0.0  # 硬锁定
+```
 
 #### 2. 动作引导（reference_motion）
 
@@ -241,8 +265,47 @@ ref_latents.append(vae.encode(previous_video[-1:]))  # 末帧
 | 无图像 | T2V | 纯文本 |
 | start_image | I2V | 首帧锚定 |
 | start + end | FLF2V | 首尾帧锚定 |
-| prev_latent | LATENT_CONTINUE | 无损续接 |
-| prev_latent + start | SVI-like | 风格锚点 + 无损续接 |
+| prev_latent | LATENT_CONTINUE | 无损续接（简单模式） |
+| prev_latent + start_image | **SVI_CONTINUE** | 高/低噪分离续接 |
+
+### SVI_CONTINUE 模式（高级续接）
+
+> 借鉴 Wan22FMLF 的 SVI 模式，实现高/低噪阶段分离的精细控制
+
+**触发条件**：`prev_latent` + `start_image` + `motion_frames > 0`
+
+**核心机制**：
+```python
+# 高噪阶段：用 prev_latent 的最后 N latent frames 保证动作连续
+motion_latent_count = ((motion_frames - 1) // 4) + 1
+motion_latent = prev_latent["samples"][:, :, -motion_latent_count:]
+
+# 构建高噪 conditioning
+image_cond_latent = torch.zeros(...)
+image_cond_latent[:, :, :1] = anchor_latent  # start_image 编码
+image_cond_latent[:, :, 1:1+motion_latent_count] = motion_latent  # 续接帧
+# ... 可选 middle_image, end_image
+
+positive_high = set_values(positive, {
+    "concat_latent_image": image_cond_latent,
+    "concat_mask": mask_high  # 锁定 anchor + motion 区域
+})
+
+# 低噪阶段：只用 start_image 保证风格一致性，不受 motion_latent 约束
+image_low = gray_canvas
+image_low[:start_image.shape[0]] = start_image
+concat_latent_image_low = vae.encode(image_low)
+
+positive_low = set_values(positive, {
+    "concat_latent_image": concat_latent_image_low,
+    "concat_mask": mask_low  # 只锁定 start_image 区域
+})
+```
+
+**优势**：
+- 高噪阶段：motion_latent 硬锁定，保证帧间连续性
+- 低噪阶段：不受 motion_latent 约束，避免颜色/风格漂移
+- 无损 latent 空间操作，跳过 VAE 编解码
 
 ### 核心机制
 
@@ -358,13 +421,15 @@ ref_latents.append(vae.encode(previous_video[-1:]))  # 末帧
 
 ### 从 Wan 借鉴
 
-| 技术 | 应用节点 |
-|------|---------|
-| motion_frames 重叠续接 | Extend, Advanced |
-| 无损 latent 续接 | Advanced |
-| 双 mask 系统（可选） | Advanced |
-| ~~空间梯度增强~~ | ~~I2V (FLF2V 隐式), Advanced (开关控制)~~ **已放弃** |
-| SVI 兼容模式 | I2V, Extend, Advanced（开关控制） |
+| 技术 | 应用节点 | 说明 |
+|------|---------|------|
+| AUTO_CONTINUE 模式 | Extend | IMAGE 空间，2 cond，高/低噪相同 |
+| SVI_CONTINUE 模式 | Advanced | LATENT 空间，4 cond，高/低噪分离 |
+| LATENT_CONTINUE 模式 | Advanced | 简单无损续接，1 latent frame |
+| 无损 latent 续接 | Advanced | 跳过 VAE 编解码 |
+| 双 mask 系统 | Advanced | 高噪/低噪使用不同 mask |
+| ~~空间梯度增强~~ | ~~I2V (FLF2V 隐式), Advanced (开关控制)~~ | **已放弃** |
+| SVI 兼容模式 | I2V, Extend, Advanced | latent 填充方式（开关控制） |
 
 ### 节点对比
 
@@ -375,8 +440,10 @@ ref_latents.append(vae.encode(previous_video[-1:]))  # 末帧
 | reference_motion 类型 | 从 IMAGE | 从 IMAGE | LATENT |
 | 参考数量 | 1 | 1 | 任意 |
 | 输出 | 2 cond | 2 cond | 4 cond |
-| ~~空间梯度增强~~ | ~~FLF2V 隐式~~ | ~~❌~~ | ~~开关控制~~ **已放弃** |
-| SVI 兼容模式 | 开关 | 开关 | 开关 |
+| 续接模式 | - | AUTO_CONTINUE | SVI_CONTINUE / LATENT_CONTINUE |
+| 续接输入 | - | IMAGE (previous_video) | LATENT (prev_latent) |
+| 高/低噪分离 | ❌ | ❌ | ✅ |
+| SVI 兼容填充 | 开关 | 开关 | 开关 |
 
 ---
 
@@ -398,6 +465,84 @@ image_frames = (latent_frames - 1) * 4 + 1
 | 73 | 19 |
 | 81 | 21 |
 | 97 | 25 |
+
+---
+
+## 视频续接模式深度分析
+
+> 基于 Wan22FMLF 代码分析的新发现
+
+### 三种续接模式对比
+
+| 模式 | 输入类型 | continue_frames_count 用途 | 高噪 mask | 低噪 mask | cond 输出 |
+|------|----------|---------------------------|-----------|-----------|-----------|
+| **AUTO_CONTINUE** | `motion_frames` (IMAGE) | 控制取多少 image frames | 锁定 motion_frames 区域 | 锁定 motion_frames 区域 | 2 cond 可用 |
+| **SVI** | `prev_latent` (LATENT) | 转换为 latent frames | 锁定 motion_latent 区域 | **不锁定**，用 start_image | 需要 3+ cond |
+| **LATENT_CONTINUE** | `prev_latent` (LATENT) | 仅判断是否启用 | 锁定 1 latent frame | 锁定 1 latent frame | 2 cond 可用 |
+
+### SVI 模式的特殊性（`svi_continue_mode`）
+
+**触发条件**：
+```python
+if long_video_mode == 'SVI' and has_prev_latent and continue_frames_count > 0:
+    svi_continue_mode = True
+```
+
+**关键差异**：SVI 模式下高噪/低噪阶段使用不同的 conditioning：
+
+| 阶段 | concat_latent_image | mask 锁定区域 | 目的 |
+|------|---------------------|--------------|------|
+| **高噪 (high)** | 包含 motion_latent | motion_latent 区域锁定 | 保证动作连续性 |
+| **低噪 (low)** | 只有 start_image | 只锁定 start_image 区域 | 保证风格/颜色一致性 |
+
+```python
+# SVI 模式下低噪阶段的特殊处理
+if svi_continue_mode:
+    image_low = torch.ones((length, height, width, 3), device=device) * 0.5
+    if start_image is not None:
+        image_low[:start_image.shape[0]] = start_image[:, :, :, :3]
+        mask_low_noise[:, :, :start_latent_frames * 4] = 0.0
+    concat_latent_image_low = vae.encode(image_low[:, :, :, :3])
+```
+
+### 后处理拼接 vs Conditioning 层面的重叠
+
+**重要发现**：这是两个不同的概念！
+
+| 层面 | 参数 | 作用 |
+|------|------|------|
+| **Conditioning** | `continue_frames_count` / `motion_frames` | 告诉模型"接续这些帧" |
+| **后处理拼接** | KJNodes `overlap` | 用于平滑混合两段解码后的视频 |
+
+**这两个值可以不同**：
+- SVI 模式下，conditioning 可能只需要少量帧（1 latent frame，即 continue_frames_count < 4）
+- 但后处理拼接可能需要更多帧（如 overlap = 5）做平滑过渡
+
+### 对节点设计的影响
+
+#### PainterI2V Extend（2 cond 输出）
+
+使用 **AUTO_CONTINUE** 模式：
+- 高噪/低噪阶段使用相同的 conditioning
+- `motion_frames` 同时控制：
+  1. 从 previous_video 取多少帧
+  2. 填入输出序列开头的帧数
+  3. 后处理需要裁剪的帧数
+- 简单直观，适合入门用户
+
+#### PainterI2V Advanced（4 cond 输出）
+
+可选择实现 **SVI 模式**：
+- 高噪/低噪阶段使用不同的 conditioning
+- 需要 `prev_latent` (LATENT) 输入实现无损续接
+- 高噪阶段用 motion_latent 保证连续性
+- 低噪阶段用 start_image 保证风格一致性
+- 更复杂但效果可能更好
+
+### 设计决策
+
+1. **PainterI2V Extend**：仅实现 AUTO_CONTINUE 模式（IMAGE 空间，2 cond）
+2. **PainterI2V Advanced**：实现 SVI 模式（LATENT 空间，4 cond，高/低噪分离）
 
 ---
 

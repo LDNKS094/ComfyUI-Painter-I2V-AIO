@@ -15,10 +15,10 @@ import node_helpers
 from comfy_api.latest import io
 
 from ..common.utils import (
-    create_video_mask,
     apply_motion_amplitude,
     extract_reference_motion,
     merge_clip_vision_outputs,
+    apply_clip_vision,
     get_svi_padding_latent,
 )
 
@@ -124,6 +124,11 @@ class PainterI2VExtend(io.ComfyNode):
         spacial_scale = vae.spacial_compression_encode()
         latent_frames = ((length - 1) // 4) + 1
 
+        # Validate motion_frames
+        actual_motion_frames = min(motion_frames, previous_video.shape[0], length - 1)
+        if actual_motion_frames < 1:
+            actual_motion_frames = 1
+
         # Initialize output latent
         latent = torch.zeros(
             [
@@ -136,16 +141,16 @@ class PainterI2VExtend(io.ComfyNode):
             device=device,
         )
 
-        # Extract and resize last frame from previous_video as anchor
-        last_frame = previous_video[-1:].clone()
-        last_frame = comfy.utils.common_upscale(
-            last_frame.movedim(-1, 1), width, height, "bilinear", "center"
+        # Extract overlap frames from previous_video (AUTO_CONTINUE mechanism)
+        overlap_frames = previous_video[-actual_motion_frames:].clone()
+        overlap_frames = comfy.utils.common_upscale(
+            overlap_frames.movedim(-1, 1), width, height, "bilinear", "center"
         ).movedim(1, -1)
 
         has_end = end_image is not None
 
         if has_end:
-            # FLF-style continuation: start from previous + target end
+            # FLF-style continuation: overlap frames + target end
             end_image = comfy.utils.common_upscale(
                 end_image[-1:].movedim(-1, 1), width, height, "bilinear", "center"
             ).movedim(1, -1)
@@ -154,7 +159,7 @@ class PainterI2VExtend(io.ComfyNode):
                 positive,
                 negative,
                 vae,
-                last_frame,
+                overlap_frames,
                 end_image,
                 width,
                 height,
@@ -165,12 +170,12 @@ class PainterI2VExtend(io.ComfyNode):
                 svi_compatible,
             )
         else:
-            # Standard continuation: only start anchor
+            # Standard continuation: overlap frames only
             positive, negative = cls._apply_extend_conditioning(
                 positive,
                 negative,
                 vae,
-                last_frame,
+                overlap_frames,
                 width,
                 height,
                 length,
@@ -182,6 +187,8 @@ class PainterI2VExtend(io.ComfyNode):
 
         # Reference latents from previous_video last frame
         if enable_reference_latent:
+            # Use the last frame of overlap as reference
+            last_frame = overlap_frames[-1:]
             ref_latent = vae.encode(last_frame[:, :, :, :3])
             positive = node_helpers.conditioning_set_values(
                 positive, {"reference_latents": [ref_latent]}, append=True
@@ -205,16 +212,10 @@ class PainterI2VExtend(io.ComfyNode):
             )
 
         # CLIP vision - merge start and end if both provided
-        merged_clip_vision = merge_clip_vision_outputs(
+        clip_vision_output = merge_clip_vision_outputs(
             clip_vision_start, clip_vision_end
         )
-        if merged_clip_vision is not None:
-            positive = node_helpers.conditioning_set_values(
-                positive, {"clip_vision_output": merged_clip_vision}
-            )
-            negative = node_helpers.conditioning_set_values(
-                negative, {"clip_vision_output": merged_clip_vision}
-            )
+        positive, negative = apply_clip_vision(clip_vision_output, positive, negative)
 
         out_latent = {"samples": latent}
         return io.NodeOutput(positive, negative, out_latent)
@@ -225,7 +226,7 @@ class PainterI2VExtend(io.ComfyNode):
         positive,
         negative,
         vae,
-        start_frame,
+        overlap_frames,
         width,
         height,
         length,
@@ -234,7 +235,14 @@ class PainterI2VExtend(io.ComfyNode):
         motion_amplitude,
         svi_compatible=False,
     ):
-        """Standard extend mode: single start anchor"""
+        """
+        Standard extend mode with AUTO_CONTINUE mechanism.
+
+        Fills overlap_frames at the beginning of the sequence and hard-locks them (mask=0).
+        This ensures motion continuity at the junction point.
+        """
+        num_overlap = overlap_frames.shape[0]
+        motion_latent_frames = ((num_overlap - 1) // 4) + 1
 
         if svi_compatible:
             # SVI mode: latents_mean padding
@@ -245,39 +253,41 @@ class PainterI2VExtend(io.ComfyNode):
                 height=height,
                 width=width,
                 spacial_scale=spacial_scale,
-                device=start_frame.device,
+                device=overlap_frames.device,
             )
-            anchor_latent = vae.encode(start_frame[:, :, :, :3])
-            concat_latent_image[:, :, 0:1] = anchor_latent
+            # Encode overlap frames and insert at beginning
+            overlap_latent = vae.encode(overlap_frames[:, :, :, :3])
+            concat_latent_image[:, :, :motion_latent_frames] = overlap_latent[
+                :, :, :motion_latent_frames
+            ]
         else:
-            # Standard mode: gray frame encoding
+            # Standard mode: build image sequence with overlap frames at beginning
             image_seq = (
                 torch.ones(
-                    (length, height, width, start_frame.shape[-1]),
-                    device=start_frame.device,
-                    dtype=start_frame.dtype,
+                    (length, height, width, overlap_frames.shape[-1]),
+                    device=overlap_frames.device,
+                    dtype=overlap_frames.dtype,
                 )
                 * 0.5
             )
-            image_seq[0] = start_frame[0]
+            # Fill overlap frames at the beginning
+            image_seq[:num_overlap] = overlap_frames
             concat_latent_image = vae.encode(image_seq[:, :, :, :3])
 
-        # Create unified mask with sub-frame precision
-        mask = create_video_mask(
-            latent_frames=latent_frames,
-            height=height,
-            width=width,
-            spacial_scale=spacial_scale,
-            anchor_start=True,
-            anchor_end=False,
-            device=start_frame.device,
+        # Create mask: hard-lock the overlap region (mask=0)
+        mask = torch.ones(
+            (1, 4, latent_frames, height // spacial_scale, width // spacial_scale),
+            device=overlap_frames.device,
+            dtype=overlap_frames.dtype,
         )
+        # Lock the motion_frames region
+        mask[:, :, :motion_latent_frames] = 0.0
 
-        # Motion amplitude enhancement
-        if motion_amplitude > 1.0:
+        # Motion amplitude enhancement (apply only to non-locked region)
+        if motion_amplitude > 1.0 and not svi_compatible:
             concat_latent_image = apply_motion_amplitude(
                 concat_latent_image,
-                base_frame_idx=0,
+                base_frame_idx=num_overlap - 1,  # Use last overlap frame as base
                 amplitude=motion_amplitude,
                 protect_brightness=True,
             )
@@ -298,7 +308,7 @@ class PainterI2VExtend(io.ComfyNode):
         positive,
         negative,
         vae,
-        start_frame,
+        overlap_frames,
         end_frame,
         width,
         height,
@@ -308,7 +318,14 @@ class PainterI2VExtend(io.ComfyNode):
         motion_amplitude,
         svi_compatible=False,
     ):
-        """FLF-style extend mode: start + end anchors"""
+        """
+        FLF-style extend mode with AUTO_CONTINUE mechanism.
+
+        Fills overlap_frames at the beginning + end_frame at the end.
+        Hard-locks both regions (mask=0).
+        """
+        num_overlap = overlap_frames.shape[0]
+        motion_latent_frames = ((num_overlap - 1) // 4) + 1
 
         if svi_compatible:
             # SVI mode: latents_mean padding
@@ -320,12 +337,16 @@ class PainterI2VExtend(io.ComfyNode):
                 width=width,
                 spacial_scale=spacial_scale,
             )
-            start_latent = vae.encode(start_frame[:, :, :, :3])
+            # Encode and insert overlap frames at beginning
+            overlap_latent = vae.encode(overlap_frames[:, :, :, :3])
+            concat_latent_image[:, :, :motion_latent_frames] = overlap_latent[
+                :, :, :motion_latent_frames
+            ]
+            # Encode and insert end frame
             end_latent = vae.encode(end_frame[:, :, :, :3])
-            concat_latent_image[:, :, 0:1] = start_latent
             concat_latent_image[:, :, -1:] = end_latent
         else:
-            # Standard mode: gray frame encoding
+            # Standard mode: build image sequence
             image_seq = (
                 torch.ones(
                     (length, height, width, 3),
@@ -334,19 +355,22 @@ class PainterI2VExtend(io.ComfyNode):
                 )
                 * 0.5
             )
-            image_seq[0] = start_frame[0, :, :, :3]
+            # Fill overlap frames at the beginning
+            image_seq[:num_overlap] = overlap_frames[:, :, :, :3]
+            # Fill end frame
             image_seq[-1] = end_frame[0, :, :, :3]
             concat_latent_image = vae.encode(image_seq)
 
-        # Create unified mask with sub-frame precision
-        mask = create_video_mask(
-            latent_frames=latent_frames,
-            height=height,
-            width=width,
-            spacial_scale=spacial_scale,
-            anchor_start=True,
-            anchor_end=True,
+        # Create mask: hard-lock overlap region + end frame
+        mask = torch.ones(
+            (1, 4, latent_frames, height // spacial_scale, width // spacial_scale),
+            device=concat_latent_image.device,
+            dtype=concat_latent_image.dtype,
         )
+        # Lock the motion_frames region at start
+        mask[:, :, :motion_latent_frames] = 0.0
+        # Lock the end frame
+        mask[:, :, -1:] = 0.0
 
         # Inject conditioning
         positive = node_helpers.conditioning_set_values(
