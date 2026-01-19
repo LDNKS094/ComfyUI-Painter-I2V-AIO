@@ -1,0 +1,16 @@
+[project]
+name = "comfyui-painter-aio"
+version = "0.1.0"
+description = "All-in-One collection of Painter's ComfyUI nodes for video generation"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/your-username/ComfyUI-PainterAIO"
+
+[tool.comfy]
+PublisherId = "your-publisher-id"
+DisplayName = "Painter AIO"
+Icon = ""

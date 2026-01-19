@@ -1,0 +1,393 @@
+import torch
+import comfy.model_management as mm
+import comfy.utils
+import comfy.clip_vision
+import node_helpers
+import torch.nn.functional as F
+from comfy_api.latest import io
+
+
+class PainterI2V(io.ComfyNode):
+    """
+    Unified Wan2.2 Video Conditioning Node - supports T2V, I2V, and FLF2V modes.
+
+    Modes (auto-detected based on inputs):
+    - T2V: No images → pure text-to-video conditioning
+    - I2V: start_image only → image-to-video with motion amplitude fix for 4-step LoRAs
+    - FLF2V: start_image + end_image → first-last-frame interpolation with inverse structural repulsion
+
+    Key features:
+    - Motion amplitude enhancement to fix slow-motion issues in accelerated models
+    - Frequency separation algorithm (FLF2V mode) preserves color while boosting structure
+    - Dual CLIP vision support for semantic transition guidance
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="PainterI2V",
+            category="conditioning/video_models",
+            inputs=[
+                io.Conditioning.Input("positive"),
+                io.Conditioning.Input("negative"),
+                io.Vae.Input("vae"),
+                io.Int.Input("width", default=832, min=16, max=4096, step=16),
+                io.Int.Input("height", default=480, min=16, max=4096, step=16),
+                io.Int.Input("length", default=81, min=1, max=4096, step=4),
+                io.Int.Input("batch_size", default=1, min=1, max=4096),
+                io.Float.Input(
+                    "motion_amplitude",
+                    default=1.15,
+                    min=1.0,
+                    max=2.0,
+                    step=0.05,
+                    tooltip="1.0 = Original, 1.15 = Recommended for I2V, up to 2.0 for high-speed motion",
+                ),
+                io.ClipVisionOutput.Input("clip_vision_start", optional=True),
+                io.ClipVisionOutput.Input("clip_vision_end", optional=True),
+                io.Image.Input("start_image", optional=True),
+                io.Image.Input("end_image", optional=True),
+                io.Boolean.Input(
+                    "enable_reference_latent",
+                    default=True,
+                    optional=True,
+                    tooltip="[DEBUG] Enable reference_latents injection. Disable to test if it affects motion amplitude.",
+                ),
+            ],
+            outputs=[
+                io.Conditioning.Output(display_name="positive"),
+                io.Conditioning.Output(display_name="negative"),
+                io.Latent.Output(display_name="latent"),
+            ],
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        positive,
+        negative,
+        vae,
+        width,
+        height,
+        length,
+        batch_size,
+        motion_amplitude=1.15,
+        clip_vision_start=None,
+        clip_vision_end=None,
+        start_image=None,
+        end_image=None,
+        enable_reference_latent=True,
+    ) -> io.NodeOutput:
+        spacial_scale = vae.spacial_compression_encode()
+        latent_frames = ((length - 1) // 4) + 1
+
+        # Initialize zero latent
+        latent = torch.zeros(
+            [
+                batch_size,
+                vae.latent_channels,
+                latent_frames,
+                height // spacial_scale,
+                width // spacial_scale,
+            ],
+            device=mm.intermediate_device(),
+        )
+
+        # Determine mode based on inputs
+        has_start = start_image is not None
+        has_end = end_image is not None
+
+        if has_start or has_end:
+            # Preprocess images
+            if has_start:
+                start_image = comfy.utils.common_upscale(
+                    start_image[:1].movedim(-1, 1), width, height, "bilinear", "center"
+                ).movedim(1, -1)
+
+            if has_end:
+                end_image = comfy.utils.common_upscale(
+                    end_image[-1:].movedim(-1, 1), width, height, "bilinear", "center"
+                ).movedim(1, -1)
+
+            if has_start and has_end:
+                # ==================== FLF2V MODE ====================
+                # First-Last-Frame with Inverse Structural Repulsion
+                positive, negative = cls._apply_flf2v_conditioning(
+                    positive,
+                    negative,
+                    vae,
+                    start_image,
+                    end_image,
+                    width,
+                    height,
+                    length,
+                    spacial_scale,
+                    latent_frames,
+                    motion_amplitude,
+                    enable_reference_latent,
+                )
+            else:
+                # ==================== I2V MODE ====================
+                # Single frame with simple difference amplification
+                image = start_image if has_start else end_image
+                positive, negative = cls._apply_i2v_conditioning(
+                    positive,
+                    negative,
+                    vae,
+                    image,
+                    has_start,
+                    width,
+                    height,
+                    length,
+                    spacial_scale,
+                    latent_frames,
+                    motion_amplitude,
+                    enable_reference_latent,
+                )
+
+        # Handle CLIP Vision outputs
+        positive, negative = cls._apply_clip_vision(
+            positive, negative, clip_vision_start, clip_vision_end
+        )
+
+        out_latent = {"samples": latent}
+        return io.NodeOutput(positive, negative, out_latent)
+
+    @classmethod
+    def _apply_i2v_conditioning(
+        cls,
+        positive,
+        negative,
+        vae,
+        image,
+        is_start_frame,
+        width,
+        height,
+        length,
+        spacial_scale,
+        latent_frames,
+        motion_amplitude,
+        enable_reference_latent=True,
+    ):
+        """I2V mode: single frame anchor with motion amplitude enhancement"""
+
+        # Create sequence: anchor frame + gray frames
+        full_image = (
+            torch.ones(
+                (length, height, width, image.shape[-1]),
+                device=image.device,
+                dtype=image.dtype,
+            )
+            * 0.5
+        )
+
+        if is_start_frame:
+            full_image[0] = image[0]
+        else:
+            full_image[-1] = image[0]
+
+        concat_latent_image = vae.encode(full_image[:, :, :, :3])
+
+        # Create mask: 0 for anchor frame, 1 for frames to generate
+        mask = torch.ones(
+            (
+                1,
+                1,
+                latent_frames,
+                concat_latent_image.shape[-2],
+                concat_latent_image.shape[-1],
+            ),
+            device=image.device,
+            dtype=image.dtype,
+        )
+        if is_start_frame:
+            mask[:, :, 0] = 0.0
+        else:
+            mask[:, :, -1] = 0.0
+
+        # Motion amplitude enhancement (brightness-protected)
+        if motion_amplitude > 1.0:
+            if is_start_frame:
+                base_latent = concat_latent_image[:, :, 0:1]
+                other_latent = concat_latent_image[:, :, 1:]
+            else:
+                base_latent = concat_latent_image[:, :, -1:]
+                other_latent = concat_latent_image[:, :, :-1]
+
+            diff = other_latent - base_latent
+            diff_mean = diff.mean(dim=(1, 3, 4), keepdim=True)
+            diff_centered = diff - diff_mean
+            scaled_latent = base_latent + diff_centered * motion_amplitude + diff_mean
+            scaled_latent = torch.clamp(scaled_latent, -6, 6)
+
+            if is_start_frame:
+                concat_latent_image = torch.cat([base_latent, scaled_latent], dim=2)
+            else:
+                concat_latent_image = torch.cat([scaled_latent, base_latent], dim=2)
+
+        # Inject conditioning
+        positive = node_helpers.conditioning_set_values(
+            positive, {"concat_latent_image": concat_latent_image, "concat_mask": mask}
+        )
+        negative = node_helpers.conditioning_set_values(
+            negative, {"concat_latent_image": concat_latent_image, "concat_mask": mask}
+        )
+
+        # Reference latents for style consistency (I2V mode only)
+        if enable_reference_latent:
+            ref_latent = vae.encode(image[:, :, :, :3])
+            positive = node_helpers.conditioning_set_values(
+                positive, {"reference_latents": [ref_latent]}, append=True
+            )
+            negative = node_helpers.conditioning_set_values(
+                negative,
+                {"reference_latents": [torch.zeros_like(ref_latent)]},
+                append=True,
+            )
+
+        return positive, negative
+
+    @classmethod
+    def _apply_flf2v_conditioning(
+        cls,
+        positive,
+        negative,
+        vae,
+        start_image,
+        end_image,
+        width,
+        height,
+        length,
+        spacial_scale,
+        latent_frames,
+        motion_amplitude,
+        enable_reference_latent=True,
+    ):
+        """FLF2V mode: first-last-frame with inverse structural repulsion"""
+
+        # Build base image sequence: start + gray + end
+        official_image = (
+            torch.ones((length, height, width, 3), device=mm.intermediate_device())
+            * 0.5
+        )
+
+        official_image[0] = start_image[0, :, :, :3]
+        official_image[-1] = end_image[0, :, :, :3]
+
+        # Create mask: 0 for anchor frames, 1 for frames to generate
+        mask = torch.ones(
+            (1, 1, latent_frames * 4, height // spacial_scale, width // spacial_scale),
+            device=mm.intermediate_device(),
+        )
+        mask[:, :, :4] = 0.0  # First frame region
+        mask[:, :, -1:] = 0.0  # Last frame region
+
+        official_latent = vae.encode(official_image)
+
+        # Compute linear interpolation baseline (for detecting "slow motion" artifacts)
+        start_l = official_latent[:, :, 0:1]
+        end_l = official_latent[:, :, -1:]
+        t = torch.linspace(
+            0.0, 1.0, official_latent.shape[2], device=official_latent.device
+        )
+        t = t.view(1, 1, -1, 1, 1)
+        linear_latent = start_l * (1 - t) + end_l * t
+
+        # ==================== Inverse Structural Repulsion ====================
+        if length > 2 and motion_amplitude > 1.001:
+            # Anti-Ghost Vector: diff between official (gray) and linear (PPT-style)
+            diff = official_latent - linear_latent
+
+            # Frequency separation (absolutely protect color)
+            h, w = diff.shape[-2], diff.shape[-1]
+
+            # Extract low frequency (color)
+            low_freq_diff = F.interpolate(
+                diff.view(-1, vae.latent_channels, h, w),
+                size=(max(1, h // 8), max(1, w // 8)),
+                mode="area",
+            )
+            low_freq_diff = F.interpolate(low_freq_diff, size=(h, w), mode="bilinear")
+            low_freq_diff = low_freq_diff.view_as(diff)
+
+            # Extract high frequency (structure/ghosting)
+            high_freq_diff = diff - low_freq_diff
+
+            # Map 1.0-2.0 input to 0.0-4.0 internal intensity
+            boost_scale = (motion_amplitude - 1.0) * 4.0
+
+            # Final composition: official + boosted high-freq
+            concat_latent_image = official_latent + (high_freq_diff * boost_scale)
+        else:
+            concat_latent_image = official_latent
+
+        # Adjust mask format
+        mask = mask.view(
+            1, mask.shape[2] // 4, 4, mask.shape[3], mask.shape[4]
+        ).transpose(1, 2)
+
+        # Inject conditioning
+        positive = node_helpers.conditioning_set_values(
+            positive, {"concat_latent_image": concat_latent_image, "concat_mask": mask}
+        )
+        negative = node_helpers.conditioning_set_values(
+            negative, {"concat_latent_image": concat_latent_image, "concat_mask": mask}
+        )
+
+        # [DEBUG] Optional reference_latents for FLF2V - test if it helps face consistency
+        if enable_reference_latent:
+            ref_latent = vae.encode(start_image[:, :, :, :3])
+            positive = node_helpers.conditioning_set_values(
+                positive, {"reference_latents": [ref_latent]}, append=True
+            )
+            negative = node_helpers.conditioning_set_values(
+                negative,
+                {"reference_latents": [torch.zeros_like(ref_latent)]},
+                append=True,
+            )
+
+        return positive, negative
+
+    @classmethod
+    def _apply_clip_vision(cls, positive, negative, clip_vision_start, clip_vision_end):
+        """Apply CLIP vision conditioning with optional dual-clip concatenation"""
+
+        clip_vision_output = None
+
+        if clip_vision_start is not None:
+            clip_vision_output = clip_vision_start
+
+        if clip_vision_end is not None:
+            if clip_vision_output is not None:
+                # Concatenate both CLIP vision hidden states for semantic transition
+                states = torch.cat(
+                    [
+                        clip_vision_output.penultimate_hidden_states,
+                        clip_vision_end.penultimate_hidden_states,
+                    ],
+                    dim=-2,
+                )
+                clip_vision_output = comfy.clip_vision.Output()
+                clip_vision_output.penultimate_hidden_states = states
+            else:
+                clip_vision_output = clip_vision_end
+
+        if clip_vision_output is not None:
+            positive = node_helpers.conditioning_set_values(
+                positive, {"clip_vision_output": clip_vision_output}
+            )
+            negative = node_helpers.conditioning_set_values(
+                negative, {"clip_vision_output": clip_vision_output}
+            )
+
+        return positive, negative
+
+
+# Node registration
+NODE_CLASS_MAPPINGS = {
+    "PainterI2V": PainterI2V,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "PainterI2V": "PainterI2V (T2V/I2V/FLF2V Unified)",
+}
