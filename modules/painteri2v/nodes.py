@@ -1,10 +1,7 @@
 import torch
 import comfy.model_management as mm
 import comfy.utils
-import comfy.clip_vision
-import comfy.latent_formats
 import node_helpers
-import torch.nn.functional as F
 from comfy_api.latest import io
 
 from ..common.utils import (
@@ -67,7 +64,7 @@ class PainterI2V(io.ComfyNode):
                     "enable_reference_latent",
                     default=True,
                     optional=True,
-                    tooltip="[DEBUG] Enable reference_latents injection. Disable to test if it affects motion amplitude.",
+                    tooltip="[DEBUG] Enable reference_latents injection.",
                 ),
                 io.Boolean.Input(
                     "svi_compatible",
@@ -93,7 +90,7 @@ class PainterI2V(io.ComfyNode):
         height,
         length,
         batch_size,
-        motion_amplitude=1.15,
+        motion_amplitude,
         clip_vision_start=None,
         clip_vision_end=None,
         start_image=None,
@@ -258,23 +255,12 @@ class PainterI2V(io.ComfyNode):
 
         # Motion amplitude enhancement (brightness-protected)
         if motion_amplitude > 1.0:
-            if is_start_frame:
-                base_latent = concat_latent_image[:, :, 0:1]
-                other_latent = concat_latent_image[:, :, 1:]
-            else:
-                base_latent = concat_latent_image[:, :, -1:]
-                other_latent = concat_latent_image[:, :, :-1]
-
-            diff = other_latent - base_latent
-            diff_mean = diff.mean(dim=(1, 3, 4), keepdim=True)
-            diff_centered = diff - diff_mean
-            scaled_latent = base_latent + diff_centered * motion_amplitude + diff_mean
-            scaled_latent = torch.clamp(scaled_latent, -6, 6)
-
-            if is_start_frame:
-                concat_latent_image = torch.cat([base_latent, scaled_latent], dim=2)
-            else:
-                concat_latent_image = torch.cat([scaled_latent, base_latent], dim=2)
+            concat_latent_image = apply_motion_amplitude(
+                concat_latent_image,
+                base_frame_idx=0 if is_start_frame else -1,
+                amplitude=motion_amplitude,
+                protect_brightness=True,
+            )
 
         # Inject conditioning
         positive = node_helpers.conditioning_set_values(
@@ -366,29 +352,14 @@ class PainterI2V(io.ComfyNode):
 
         # ==================== Inverse Structural Repulsion ====================
         if length > 2 and motion_amplitude > 1.001:
-            # Anti-Ghost Vector: diff between official (gray) and linear (PPT-style)
-            diff = official_latent - linear_latent
-
-            # Frequency separation (absolutely protect color)
-            h, w = diff.shape[-2], diff.shape[-1]
-
-            # Extract low frequency (color)
-            low_freq_diff = F.interpolate(
-                diff.view(-1, vae.latent_channels, h, w),
-                size=(max(1, h // 8), max(1, w // 8)),
-                mode="area",
-            )
-            low_freq_diff = F.interpolate(low_freq_diff, size=(h, w), mode="bilinear")
-            low_freq_diff = low_freq_diff.view_as(diff)
-
-            # Extract high frequency (structure/ghosting)
-            high_freq_diff = diff - low_freq_diff
-
             # Map 1.0-2.0 input to 0.0-4.0 internal intensity
             boost_scale = (motion_amplitude - 1.0) * 4.0
-
-            # Final composition: official + boosted high-freq
-            concat_latent_image = official_latent + (high_freq_diff * boost_scale)
+            concat_latent_image = apply_frequency_separation(
+                official_latent,
+                linear_latent,
+                boost_scale,
+                latent_channels=vae.latent_channels,
+            )
         else:
             concat_latent_image = official_latent
 
@@ -418,25 +389,9 @@ class PainterI2V(io.ComfyNode):
     def _apply_clip_vision(cls, positive, negative, clip_vision_start, clip_vision_end):
         """Apply CLIP vision conditioning with optional dual-clip concatenation"""
 
-        clip_vision_output = None
-
-        if clip_vision_start is not None:
-            clip_vision_output = clip_vision_start
-
-        if clip_vision_end is not None:
-            if clip_vision_output is not None:
-                # Concatenate both CLIP vision hidden states for semantic transition
-                states = torch.cat(
-                    [
-                        clip_vision_output.penultimate_hidden_states,
-                        clip_vision_end.penultimate_hidden_states,
-                    ],
-                    dim=-2,
-                )
-                clip_vision_output = comfy.clip_vision.Output()
-                clip_vision_output.penultimate_hidden_states = states
-            else:
-                clip_vision_output = clip_vision_end
+        clip_vision_output = merge_clip_vision_outputs(
+            clip_vision_start, clip_vision_end
+        )
 
         if clip_vision_output is not None:
             positive = node_helpers.conditioning_set_values(
@@ -447,13 +402,3 @@ class PainterI2V(io.ComfyNode):
             )
 
         return positive, negative
-
-
-# Node registration
-NODE_CLASS_MAPPINGS = {
-    "PainterI2V": PainterI2V,
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "PainterI2V": "PainterI2V (T2V/I2V/FLF2V Unified)",
-}

@@ -219,14 +219,3 @@ class PainterI2VAdvanced(io.ComfyNode):
         return io.NodeOutput(
             positive, negative, positive_original, negative_original, out_latent
         )
-
-
-# Node registration for this module
-# (Aggregated in main __init__.py for package-level export)
-NODE_CLASS_MAPPINGS = {
-    "PainterI2VAdvanced": PainterI2VAdvanced,
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "PainterI2VAdvanced": "PainterI2V Advanced (Dual Sampler)",
-}

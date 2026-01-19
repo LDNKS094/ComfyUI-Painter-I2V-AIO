@@ -57,6 +57,8 @@ class PainterI2VExtend(io.ComfyNode):
                     step=0.05,
                     tooltip="1.0 = Original, 1.15 = Recommended, up to 2.0 for high-speed motion",
                 ),
+                io.ClipVisionOutput.Input("clip_vision_start", optional=True),
+                io.ClipVisionOutput.Input("clip_vision_end", optional=True),
                 io.Image.Input(
                     "previous_video",
                     tooltip="Previous video segment (required). Last frame used as anchor.",
@@ -78,12 +80,11 @@ class PainterI2VExtend(io.ComfyNode):
                     optional=True,
                     tooltip="Optional reference video for motion guidance. NOT extracted from previous_video.",
                 ),
-                io.ClipVisionOutput.Input("clip_vision", optional=True),
                 io.Boolean.Input(
                     "enable_reference_latent",
                     default=True,
                     optional=True,
-                    tooltip="Enable reference_latents injection from previous_video last frame.",
+                    tooltip="[DEBUG] Enable reference_latents injection from previous_video last frame.",
                 ),
                 io.Boolean.Input(
                     "svi_compatible",
@@ -111,10 +112,11 @@ class PainterI2VExtend(io.ComfyNode):
         batch_size,
         motion_amplitude,
         previous_video,
+        clip_vision_start=None,
+        clip_vision_end=None,
         motion_frames=5,
         end_image=None,
         reference_video=None,
-        clip_vision=None,
         enable_reference_latent=True,
         svi_compatible=False,
     ) -> io.NodeOutput:
@@ -202,13 +204,16 @@ class PainterI2VExtend(io.ComfyNode):
                 negative, {"reference_motion": ref_motion_latent}
             )
 
-        # CLIP vision
-        if clip_vision is not None:
+        # CLIP vision - merge start and end if both provided
+        merged_clip_vision = merge_clip_vision_outputs(
+            clip_vision_start, clip_vision_end
+        )
+        if merged_clip_vision is not None:
             positive = node_helpers.conditioning_set_values(
-                positive, {"clip_vision_output": clip_vision}
+                positive, {"clip_vision_output": merged_clip_vision}
             )
             negative = node_helpers.conditioning_set_values(
-                negative, {"clip_vision_output": clip_vision}
+                negative, {"clip_vision_output": merged_clip_vision}
             )
 
         out_latent = {"samples": latent}
@@ -352,13 +357,3 @@ class PainterI2VExtend(io.ComfyNode):
         )
 
         return positive, negative
-
-
-# Node registration
-NODE_CLASS_MAPPINGS = {
-    "PainterI2VExtend": PainterI2VExtend,
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "PainterI2VExtend": "PainterI2V Extend (Video Continuation)",
-}
