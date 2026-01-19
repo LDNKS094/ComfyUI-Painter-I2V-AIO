@@ -28,6 +28,7 @@ from .modules.wan22fmlf import (
     WanAdvancedExtractLastImages,
 )
 from .modules.painteri2v import PainterI2V
+from .modules.painteri2v_extend import PainterI2VExtend
 from .modules.painteri2v_advanced import PainterI2VAdvanced
 # PainterFLF2V functionality merged into PainterI2V (auto-detects FLF2V mode when end_image is provided)
 
@@ -58,6 +59,8 @@ class PainterAIOExtension(ComfyExtension):
             WanAdvancedExtractLastImages,
             # painteri2v
             PainterI2V,
+            # painteri2v_extend
+            PainterI2VExtend,
             # painteri2v_advanced
             PainterI2VAdvanced,
             # Note: PainterFLF2V merged into PainterI2V

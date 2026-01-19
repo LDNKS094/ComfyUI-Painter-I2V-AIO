@@ -116,6 +116,7 @@
 - 双 mask 系统：mask_high_noise / mask_low_noise
 - 支持 structural_repulsion_boost（空间梯度运动增强）
 - 每帧独立强度控制参数
+- **不使用 reference_latents 字段**：所有参考信息通过 concat_latent_image 注入（硬约束）
 
 ### 1. DISABLED 模式
 
@@ -201,12 +202,12 @@ prev_latent → 直接复用 → latent[0] + concat_latent[0]
 
 #### 运行机制
 
-**混合模式 = AUTO_CONTINUE + LATENT_CONTINUE + 三帧控制**：
+**混合模式 = AUTO_CONTINUE + LATENT_CONTINUE + 风格锚点**：
 
 - 输入：prev_latent + 可选 start_image/end_image
 - 构建 image_cond_latent：
-  - 位置 0：start_image VAE 编码（锚点）
-  - 位置 1~N：prev_latent 末尾多帧直接复用（无损）
+  - 位置 0：start_image VAE 编码（**风格锚点，类似 initial_reference_image**）
+  - 位置 1~N：prev_latent 末尾多帧直接复用（**续接参考，无损**）
   - 位置 end：end_image VAE 编码
 - prev_latent 部分跳过 VAE，无损
 - 图像部分仍需 VAE 编码
@@ -214,12 +215,22 @@ prev_latent → 直接复用 → latent[0] + concat_latent[0]
 
 **数据流**：
 ```
-prev_latent → 直接用 → image_cond_latent[1:N]  (无损)
-start_image → VAE.encode → image_cond_latent[0]
-end_image → VAE.encode → image_cond_latent[end]
+start_image → VAE.encode → image_cond_latent[0]   (风格锚点)
+prev_latent → 直接用 → image_cond_latent[1:N]     (续接参考，无损)
+end_image → VAE.encode → image_cond_latent[end]   (尾帧锚定)
 ```
 
-**特点**：最完整模式，混合无损续接 + 三帧控制
+**与 PainterLongVideo 的设计对应**：
+
+| SVI 模式 | PainterLongVideo | 作用 |
+|---------|------------------|------|
+| start_image (位置0) | initial_reference_image | 全局风格锚点 |
+| prev_latent (位置1~N) | previous_video | 续接参考 |
+| end_image (位置end) | end_image | 尾帧锚定 |
+
+**关键差异**：SVI 将所有参考放入 concat_latent_image（硬约束），而非 reference_latents（软引导）
+
+**特点**：最完整模式，混合无损续接 + 风格锚点
 
 #### 使用场景
 
@@ -331,6 +342,117 @@ end_image → VAE.encode → image_cond_latent[end]
 
 ---
 
+## 第六部分：reference_latents 使用策略对比
+
+### 两位作者的不同选择
+
+| 作者 | 使用 reference_latents | 策略 |
+|------|----------------------|------|
+| **Painter** | ✅ 积极使用 | 软引导，通过 cross-attention 影响生成 |
+| **Wan22FMLF** | ❌ 不使用 | 全部依赖 concat_latent_image 硬约束 |
+
+### Painter 系列的 reference_latents 使用
+
+| 节点 | 数量 | 来源 |
+|------|------|------|
+| PainterI2V (I2V模式) | 1 | 首帧 |
+| PainterI2V (FLF2V模式) | 0 (可选1) | 无 / 首帧 |
+| PainterI2VAdvanced | 1 | 首帧 |
+| PainterLongVideo | 1-2 | 上段末帧 + initial_reference_image |
+
+### Wan 系列的替代方案
+
+虽然 Wan 不使用 reference_latents 字段，但 SVI 模式通过 concat_latent_image 实现了类似功能：
+
+| 功能 | PainterLongVideo 方式 | Wan SVI 方式 |
+|------|---------------------|--------------|
+| 风格锚点 | initial_reference_image → reference_latents | start_image → concat_latent[0] |
+| 续接参考 | previous_video → reference_motion | prev_latent → concat_latent[1:N] |
+| 约束类型 | 软引导 (cross-attention) | 硬约束 (concat) |
+
+### 硬约束 vs 软引导的权衡
+
+| 维度 | concat_latent (硬约束) | reference_latents (软引导) |
+|------|----------------------|---------------------------|
+| 约束强度 | 强，像素级 | 弱，语义级 |
+| 生成自由度 | 低 | 高 |
+| 一致性保证 | 高 | 中 |
+| 运动幅度影响 | 可能限制运动 | 影响较小 |
+| 适用场景 | 需要严格一致 | 需要风格参考但允许变化 |
+
+---
+
+## 第七部分：续接输入设计对比
+
+### 核心差异：输入语义分离
+
+| 维度 | Painter (PainterLongVideo) | Wan22FMLF |
+|------|---------------------------|-----------|
+| **续接输入** | `previous_video` (混合用途) | `motion_frames` / `prev_latent` (纯续接) |
+| **动作引导** | `reference_motion` (软引导全片) | **无此机制** |
+| **模式切换** | 隐式（根据输入组合） | 显式 (`long_video_mode` 参数) |
+| **设计哲学** | 单输入多用途 | 多输入单用途 |
+
+### Painter 的 `previous_video` 行为分析
+
+**问题：同一输入在不同分支有不同语义**
+
+| 分支 | 触发条件 | previous_video 的角色 |
+|------|---------|----------------------|
+| **A/B** | 有 start_image 或 end_image | **仅动作参考** — 不影响首帧 |
+| **C** | 仅 previous_video | **前置续接** — 末帧变首帧 + 动作参考 |
+
+```
+Painter previous_video 数据流：
+┌─────────────────────────────────────────┐
+│  previous_video (同一个输入)             │
+│       │                                 │
+│       ├──→ 末帧→首帧 (concat_latent)     │  ← 硬锚定
+│       │                                 │
+│       └──→ 后73帧 → VAE → reference_motion  │  ← 软引导全片
+└─────────────────────────────────────────┘
+```
+
+### Wan22FMLF 的显式分离设计
+
+```python
+# Wan 使用不同输入名明确区分：
+"motion_frames": ("IMAGE",),    # 续接参考（上一段末尾帧序列）→ 硬锚定
+"prev_latent": ("LATENT",),     # 无损续接（直接注入 latent）→ 硬锚定
+"start_image": ("IMAGE",),      # 风格/视觉锚点 → 硬锚定
+"long_video_mode": COMBO,       # 显式切换模式
+```
+
+```
+Wan AUTO_CONTINUE 数据流：
+┌─────────────────────────────────────────┐
+│  motion_frames ──→ 首帧区域硬锚定        │
+│  start_image ──→ 可选的风格锚点          │
+│  end_image ──→ 尾帧硬锚定               │
+│                                         │
+│  无 reference_motion，无全片动作引导     │
+└─────────────────────────────────────────┘
+```
+
+### 关键发现
+
+1. **Painter 的 `reference_motion` 是独有特性**，Wan 不使用此机制
+2. **Painter 的设计问题**：续接和动作引导捆绑在同一输入，用户无法独立控制
+3. **Wan 的设计优势**：输入语义清晰，每个输入单一用途
+
+### 重构建议
+
+保留 Painter 独有的 `reference_motion` 优势，但学习 Wan 的显式分离：
+
+```python
+# PainterI2V Extend 建议设计
+"previous_video": ("IMAGE",),           # 必须，用于续接（末帧→首帧）
+"enable_motion_guidance": ("BOOLEAN",), # 开关：是否从 previous_video 提取 reference_motion
+"motion_guidance_strength": ("FLOAT",), # 可选：reference_motion 影响强度
+```
+
+---
+
 ## 结论
 
 两个系列各有优势：
@@ -340,6 +462,7 @@ end_image → VAE.encode → image_cond_latent[end]
 | 色彩保护 | ✅ 频率分离 + 色彩保护算法 | - |
 | 双阶段 latent 分离 | ✅ PainterI2VAdvanced | - |
 | 软引导续接 | ✅ reference_motion/latents | - |
+| 输入语义清晰 | - | ✅ 多输入单用途 |
 | 无损续接 | - | ✅ LATENT_CONTINUE/SVI |
 | 续接模式多样性 | - | ✅ 三种模式 |
 | 强度精细控制 | - | ✅ 5个独立参数 |
@@ -347,5 +470,137 @@ end_image → VAE.encode → image_cond_latent[end]
 **合并方向建议**：
 1. 保留 Painter 的 latent 分离和色彩保护机制
 2. 引入 Wan 的无损 latent 续接能力
-3. 可选：引入 Wan 的 mask 空间梯度作为补充增强手段
-4. 统一软引导机制（reference_motion/latents）到所有续接模式
+3. ~~可选：引入 Wan 的 mask 空间梯度作为补充增强手段~~ （已确认放弃，见下方分析）
+4. **学习 Wan 的输入语义分离设计**，将 reference_motion 作为可控开关
+5. 统一软引导机制（reference_motion/latents）到所有续接模式
+6. **修复 SVI LoRA 兼容性问题**（见第八部分）
+
+---
+
+## 第八部分：技术决策记录
+
+### 8.1 空间梯度机制（structural_repulsion_boost）
+
+**结论：放弃引入**
+
+#### 测试结果
+
+| boost 值 | 效果 |
+|----------|------|
+| 1.0 | 关闭，无效果 |
+| 1.15-1.5 | 轻微影响，不明显优于 Painter 频率分离 |
+| 2.0 | 变化区域出现灰色雾状画面（过度约束） |
+| 仅首帧 | 完全不生效（机制需要首尾帧计算差异） |
+
+#### 机制缺陷
+
+1. **静态分析，无法预测动态**：只能识别首尾帧的像素差异，无法理解中间运动轨迹
+2. **边界问题**：肢体运动轨迹穿过"低变化区"时被异常约束
+3. **实际镜头不适用**：曝光、光影、压缩噪声导致全局差异，难以正确识别静态区域
+4. **Wan 节点的实际效果**：动态偏低，与此机制的过度约束有关
+
+#### 对比
+
+| 机制 | 问题 |
+|------|------|
+| Wan 空间梯度 | 过度约束 → 动态低 |
+| Painter 无约束 | 过度自由 → 背景扭曲 |
+
+**解决背景扭曲应通过其他方式（如调整 reference_latents 覆盖范围），而非引入空间梯度。**
+
+---
+
+### 8.2 SVI LoRA 兼容性问题
+
+**问题现象**：加载 SVI2 Pro LoRA 后，Painter 节点生成的视频开头闪白，Wan SVI 模式正常。
+
+#### 根本原因
+
+**非锚定帧的 latent 填充方式不同**：
+
+| 节点 | 非锚定帧填充方式 | 实际值 |
+|------|-----------------|--------|
+| Wan SVI / KJNodes SVI | `zeros → Wan21().process_out()` | `latents_mean`（模型训练时的中性值） |
+| Painter | `vae.encode(0.5 灰帧)` | 灰帧的 latent 编码（非中性值） |
+
+#### Wan21 latent format 的 process_out
+
+```python
+class Wan21(LatentFormat):
+    def __init__(self):
+        self.latents_mean = torch.tensor([...])  # 16 通道的均值向量
+        self.latents_std = torch.tensor([...])   # 16 通道的标准差向量
+    
+    def process_out(self, latent):
+        # 将内部 latent 转换为模型期望的格式
+        return latent * latents_std / scale_factor + latents_mean
+```
+
+**`process_out(zeros)` 返回 `latents_mean`，这是 Wan 模型定义的"中性空位"。**
+
+#### 验证
+
+KJNodes `WanImageToVideoSVIPro` 节点（第 3076-3077 行）：
+```python
+padding = torch.zeros(1, C, padding_size, H, W, dtype=dtype, device=device)
+padding = comfy.latent_formats.Wan21().process_out(padding)  # ← 关键转换
+image_cond_latent = torch.cat([image_cond_latent, padding], dim=2)
+```
+
+Wan 节点 SVI 模式（第 304-306 行）：
+```python
+image_cond_latent = torch.zeros(1, latent_channels, total_latents, H, W, ...)
+image_cond_latent = comfy.latent_formats.Wan21().process_out(image_cond_latent)
+```
+
+两者逻辑一致：**非锚定帧位置使用 `latents_mean` 填充**。
+
+#### 解决方案
+
+~~修改 Painter 节点，将非锚定帧的填充方式从 `vae.encode(灰帧)` 改为 `Wan21().process_out(zeros)`~~
+
+**更正**：经测试验证，SVI 模式专为 SVI LoRA 设计，标准 Wan 模型使用 SVI 模式会导致异常。两种填充方式适用于不同场景：
+
+| 填充方式 | 适用模型 | 节点/模式 |
+|----------|----------|-----------|
+| `vae.encode(灰帧)` | 标准 Wan 模型 | Painter 节点、Wan DISABLE 模式 |
+| `Wan21().process_out(zeros)` = `latents_mean` | SVI LoRA | Wan SVI 模式、KJNodes SVI |
+
+**SVI LoRA 官方说明**（来自 vita-epfl/Stable-Video-Infinity README）：
+> "SVI LoRA cannot directly use the original Wan 2.1 workflow - **it requires modified padding settings**."
+
+#### 最终方案
+
+**添加 `svi_compatible` 开关**：
+
+```python
+io.Boolean.Input(
+    "svi_compatible", 
+    default=False,
+    tooltip="Enable for SVI LoRA compatibility. Uses latents_mean padding instead of gray frame encoding."
+)
+
+# 实现逻辑
+if svi_compatible:
+    # SVI LoRA 兼容模式
+    concat_latent_image = torch.zeros(1, 16, latent_frames, H, W, device=device)
+    concat_latent_image = comfy.latent_formats.Wan21().process_out(concat_latent_image)
+    # 覆盖锚定帧
+    concat_latent_image[:, :, 0:1] = vae.encode(start_image)
+else:
+    # 标准模式（当前 Painter 行为）
+    image = torch.ones((length, height, width, 3)) * 0.5
+    image[0] = start_image[0]
+    concat_latent_image = vae.encode(image)
+```
+
+| svi_compatible | 填充方式 | 适用场景 |
+|----------------|----------|----------|
+| **False** (默认) | `vae.encode(灰帧)` | 标准 Wan 模型、4-step LoRA |
+| **True** | `latents_mean` | SVI LoRA |
+
+#### 关键发现
+
+1. **Painter 的灰帧编码是正确的**（对于标准 Wan 模型）
+2. **SVI 模式是专用的**，需要配合 SVI LoRA 使用
+3. **不存在"通用更好"的填充方式**，需要根据使用的模型/LoRA 选择

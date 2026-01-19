@@ -2,9 +2,19 @@ import torch
 import comfy.model_management as mm
 import comfy.utils
 import comfy.clip_vision
+import comfy.latent_formats
 import node_helpers
 import torch.nn.functional as F
 from comfy_api.latest import io
+
+from ..common.utils import (
+    create_video_mask,
+    apply_motion_amplitude,
+    apply_frequency_separation,
+    extract_reference_motion,
+    merge_clip_vision_outputs,
+    get_svi_padding_latent,
+)
 
 
 class PainterI2V(io.ComfyNode):
@@ -47,11 +57,22 @@ class PainterI2V(io.ComfyNode):
                 io.ClipVisionOutput.Input("clip_vision_end", optional=True),
                 io.Image.Input("start_image", optional=True),
                 io.Image.Input("end_image", optional=True),
+                io.Image.Input(
+                    "reference_video",
+                    optional=True,
+                    tooltip="Optional reference video for motion guidance. Extracts reference_motion latent.",
+                ),
                 io.Boolean.Input(
                     "enable_reference_latent",
                     default=True,
                     optional=True,
                     tooltip="[DEBUG] Enable reference_latents injection. Disable to test if it affects motion amplitude.",
+                ),
+                io.Boolean.Input(
+                    "svi_compatible",
+                    default=False,
+                    optional=True,
+                    tooltip="Enable SVI LoRA compatibility. Uses latents_mean padding instead of gray frame encoding.",
                 ),
             ],
             outputs=[
@@ -76,7 +97,9 @@ class PainterI2V(io.ComfyNode):
         clip_vision_end=None,
         start_image=None,
         end_image=None,
+        reference_video=None,
         enable_reference_latent=True,
+        svi_compatible=False,
     ) -> io.NodeOutput:
         spacial_scale = vae.spacial_compression_encode()
         latent_frames = ((length - 1) // 4) + 1
@@ -125,6 +148,7 @@ class PainterI2V(io.ComfyNode):
                     latent_frames,
                     motion_amplitude,
                     enable_reference_latent,
+                    svi_compatible,
                 )
             else:
                 # ==================== I2V MODE ====================
@@ -143,12 +167,25 @@ class PainterI2V(io.ComfyNode):
                     latent_frames,
                     motion_amplitude,
                     enable_reference_latent,
+                    svi_compatible,
                 )
 
         # Handle CLIP Vision outputs
         positive, negative = cls._apply_clip_vision(
             positive, negative, clip_vision_start, clip_vision_end
         )
+
+        # Handle reference_video → reference_motion
+        if reference_video is not None:
+            ref_motion_latent = extract_reference_motion(
+                vae, reference_video, width, height, length
+            )
+            positive = node_helpers.conditioning_set_values(
+                positive, {"reference_motion": ref_motion_latent}
+            )
+            negative = node_helpers.conditioning_set_values(
+                negative, {"reference_motion": ref_motion_latent}
+            )
 
         out_latent = {"samples": latent}
         return io.NodeOutput(positive, negative, out_latent)
@@ -168,42 +205,55 @@ class PainterI2V(io.ComfyNode):
         latent_frames,
         motion_amplitude,
         enable_reference_latent=True,
+        svi_compatible=False,
     ):
         """I2V mode: single frame anchor with motion amplitude enhancement"""
 
-        # Create sequence: anchor frame + gray frames
-        full_image = (
-            torch.ones(
-                (length, height, width, image.shape[-1]),
+        if svi_compatible:
+            # SVI mode: use latents_mean padding instead of gray frame encoding
+            concat_latent_image = get_svi_padding_latent(
+                batch_size=1,
+                latent_channels=16,
+                latent_frames=latent_frames,
+                height=height,
+                width=width,
+                spacial_scale=spacial_scale,
                 device=image.device,
-                dtype=image.dtype,
             )
-            * 0.5
-        )
-
-        if is_start_frame:
-            full_image[0] = image[0]
+            # Encode anchor frame and inject at correct position
+            anchor_latent = vae.encode(image[:, :, :, :3])
+            if is_start_frame:
+                concat_latent_image[:, :, 0:1] = anchor_latent
+            else:
+                concat_latent_image[:, :, -1:] = anchor_latent
         else:
-            full_image[-1] = image[0]
+            # Standard mode: gray frame encoding
+            full_image = (
+                torch.ones(
+                    (length, height, width, image.shape[-1]),
+                    device=image.device,
+                    dtype=image.dtype,
+                )
+                * 0.5
+            )
 
-        concat_latent_image = vae.encode(full_image[:, :, :, :3])
+            if is_start_frame:
+                full_image[0] = image[0]
+            else:
+                full_image[-1] = image[0]
 
-        # Create mask: 0 for anchor frame, 1 for frames to generate
-        mask = torch.ones(
-            (
-                1,
-                1,
-                latent_frames,
-                concat_latent_image.shape[-2],
-                concat_latent_image.shape[-1],
-            ),
+            concat_latent_image = vae.encode(full_image[:, :, :, :3])
+
+        # Create unified mask with sub-frame precision
+        mask = create_video_mask(
+            latent_frames=latent_frames,
+            height=height,
+            width=width,
+            spacial_scale=spacial_scale,
+            anchor_start=is_start_frame,
+            anchor_end=not is_start_frame,
             device=image.device,
-            dtype=image.dtype,
         )
-        if is_start_frame:
-            mask[:, :, 0] = 0.0
-        else:
-            mask[:, :, -1] = 0.0
 
         # Motion amplitude enhancement (brightness-protected)
         if motion_amplitude > 1.0:
@@ -262,27 +312,47 @@ class PainterI2V(io.ComfyNode):
         latent_frames,
         motion_amplitude,
         enable_reference_latent=True,
+        svi_compatible=False,
     ):
         """FLF2V mode: first-last-frame with inverse structural repulsion"""
 
-        # Build base image sequence: start + gray + end
-        official_image = (
-            torch.ones((length, height, width, 3), device=mm.intermediate_device())
-            * 0.5
+        if svi_compatible:
+            # SVI mode: use latents_mean padding for middle frames
+            concat_latent_image = get_svi_padding_latent(
+                batch_size=1,
+                latent_channels=16,
+                latent_frames=latent_frames,
+                height=height,
+                width=width,
+                spacial_scale=spacial_scale,
+            )
+            # Encode and inject anchor frames
+            start_latent = vae.encode(start_image[:, :, :, :3])
+            end_latent = vae.encode(end_image[:, :, :, :3])
+            concat_latent_image[:, :, 0:1] = start_latent
+            concat_latent_image[:, :, -1:] = end_latent
+            official_latent = concat_latent_image
+        else:
+            # Standard mode: gray frame encoding
+            official_image = (
+                torch.ones((length, height, width, 3), device=mm.intermediate_device())
+                * 0.5
+            )
+
+            official_image[0] = start_image[0, :, :, :3]
+            official_image[-1] = end_image[0, :, :, :3]
+
+            official_latent = vae.encode(official_image)
+
+        # Create unified mask with sub-frame precision
+        mask = create_video_mask(
+            latent_frames=latent_frames,
+            height=height,
+            width=width,
+            spacial_scale=spacial_scale,
+            anchor_start=True,
+            anchor_end=True,
         )
-
-        official_image[0] = start_image[0, :, :, :3]
-        official_image[-1] = end_image[0, :, :, :3]
-
-        # Create mask: 0 for anchor frames, 1 for frames to generate
-        mask = torch.ones(
-            (1, 1, latent_frames * 4, height // spacial_scale, width // spacial_scale),
-            device=mm.intermediate_device(),
-        )
-        mask[:, :, :4] = 0.0  # First frame region
-        mask[:, :, -1:] = 0.0  # Last frame region
-
-        official_latent = vae.encode(official_image)
 
         # Compute linear interpolation baseline (for detecting "slow motion" artifacts)
         start_l = official_latent[:, :, 0:1]
@@ -321,12 +391,7 @@ class PainterI2V(io.ComfyNode):
         else:
             concat_latent_image = official_latent
 
-        # Adjust mask format
-        mask = mask.view(
-            1, mask.shape[2] // 4, 4, mask.shape[3], mask.shape[4]
-        ).transpose(1, 2)
-
-        # Inject conditioning
+        # Inject conditioning (mask already in correct [1, 4, T, H, W] format)
         positive = node_helpers.conditioning_set_values(
             positive, {"concat_latent_image": concat_latent_image, "concat_mask": mask}
         )
