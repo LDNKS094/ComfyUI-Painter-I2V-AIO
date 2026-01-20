@@ -11,11 +11,13 @@ SOURCE TRACKING: Based on ComfyUI-PainterLongVideo, refactored for new API
 import torch
 import comfy.model_management as mm
 import comfy.utils
+import comfy.latent_formats
 import node_helpers
 from comfy_api.latest import io
 
 from ..common.utils import (
     apply_motion_amplitude,
+    apply_color_protect,
     extract_reference_motion,
     merge_clip_vision_outputs,
     apply_clip_vision,
@@ -81,10 +83,9 @@ class PainterI2VExtend(io.ComfyNode):
                     tooltip="Optional reference video for motion guidance. NOT extracted from previous_video.",
                 ),
                 io.Boolean.Input(
-                    "enable_reference_latent",
+                    "color_protect",
                     default=True,
-                    optional=True,
-                    tooltip="[DEBUG] Enable reference_latents injection from previous_video last frame.",
+                    tooltip="Enable color drift protection after motion amplitude enhancement.",
                 ),
                 io.Boolean.Input(
                     "svi_compatible",
@@ -117,89 +118,125 @@ class PainterI2VExtend(io.ComfyNode):
         motion_frames=5,
         end_image=None,
         reference_video=None,
-        enable_reference_latent=True,
+        color_protect=True,
         svi_compatible=False,
     ) -> io.NodeOutput:
         device = mm.intermediate_device()
         spacial_scale = vae.spacial_compression_encode()
-        latent_frames = ((length - 1) // 4) + 1
+        latent_channels = vae.latent_channels
+        latent_t = ((length - 1) // 4) + 1
+        H = height // spacial_scale
+        W = width // spacial_scale
 
-        # Validate motion_frames
+        # === 1. 初始化输出 latent ===
+        latent = torch.zeros(
+            [batch_size, latent_channels, latent_t, H, W], device=device
+        )
+
+        # === 2. 提取 overlap_frames + upscale ===
         actual_motion_frames = min(motion_frames, previous_video.shape[0], length - 1)
         if actual_motion_frames < 1:
             actual_motion_frames = 1
 
-        # Initialize output latent
-        latent = torch.zeros(
-            [
-                batch_size,
-                vae.latent_channels,
-                latent_frames,
-                height // spacial_scale,
-                width // spacial_scale,
-            ],
-            device=device,
-        )
-
-        # Extract overlap frames from previous_video (AUTO_CONTINUE mechanism)
         overlap_frames = previous_video[-actual_motion_frames:].clone()
         overlap_frames = comfy.utils.common_upscale(
             overlap_frames.movedim(-1, 1), width, height, "bilinear", "center"
         ).movedim(1, -1)
 
+        num_overlap = overlap_frames.shape[0]
+        motion_latent_frames = ((num_overlap - 1) // 4) + 1
+
+        # === 3. 预处理 end_image (如有) + 缓存编码 ===
         has_end = end_image is not None
+        end_latent_cached = None
 
         if has_end:
-            # FLF-style continuation: overlap frames + target end
             end_image = comfy.utils.common_upscale(
                 end_image[-1:].movedim(-1, 1), width, height, "bilinear", "center"
             ).movedim(1, -1)
+            end_latent_cached = vae.encode(end_image[:, :, :, :3])
 
-            positive, negative = cls._apply_flf_extend_conditioning(
-                positive,
-                negative,
-                vae,
-                overlap_frames,
-                end_image,
-                width,
-                height,
-                length,
-                spacial_scale,
-                latent_frames,
-                motion_amplitude,
-                svi_compatible,
+        # === 4. 构建 image 序列 + 编码 ===
+        if svi_compatible:
+            # SVI 模式：用 latents_mean 填充
+            concat_latent = get_svi_padding_latent(
+                batch_size=1,
+                latent_channels=latent_channels,
+                latent_frames=latent_t,
+                height=height,
+                width=width,
+                spacial_scale=spacial_scale,
+                device=device,
             )
+            # 编码 overlap 并插入开头
+            overlap_latent = vae.encode(overlap_frames[:, :, :, :3])
+            concat_latent[:, :, :motion_latent_frames] = overlap_latent[
+                :, :, :motion_latent_frames
+            ]
+            # 插入 end_image (如有)
+            if has_end and end_latent_cached is not None:
+                concat_latent[:, :, -1:] = end_latent_cached
         else:
-            # Standard continuation: overlap frames only
-            positive, negative = cls._apply_extend_conditioning(
-                positive,
-                negative,
-                vae,
-                overlap_frames,
-                width,
-                height,
-                length,
-                spacial_scale,
-                latent_frames,
-                motion_amplitude,
-                svi_compatible,
+            # 标准模式：灰色填充
+            image = torch.ones((length, height, width, 3), device=device) * 0.5
+            # 填充 overlap frames 到开头
+            image[:num_overlap] = overlap_frames[:, :, :, :3]
+            # 填充 end_image (如有)
+            if has_end:
+                image[-1] = end_image[0, :, :, :3]
+            concat_latent = vae.encode(image)
+
+        # === 5. 保存原始 concat_latent ===
+        concat_latent_original = concat_latent.clone()
+
+        # === 6. 构建 mask ===
+        mask = torch.ones((1, 1, latent_t, H, W), device=device)
+        # 锁定 motion_frames 区域 (开头)
+        mask[:, :, :motion_latent_frames] = 0.0
+        # 锁定 end_frame (如有)
+        if has_end:
+            mask[:, :, -1:] = 0.0
+
+        # === 7. 应用 motion_amplitude ===
+        if motion_amplitude > 1.0 and not svi_compatible:
+            concat_latent = apply_motion_amplitude(
+                concat_latent,
+                base_frame_idx=num_overlap - 1,  # 用最后一个 overlap frame 作为基准
+                amplitude=motion_amplitude,
+                protect_brightness=True,
             )
 
-        # Reference latents from previous_video last frame
-        if enable_reference_latent:
-            # Use the last frame of overlap as reference
-            last_frame = overlap_frames[-1:]
-            ref_latent = vae.encode(last_frame[:, :, :, :3])
-            positive = node_helpers.conditioning_set_values(
-                positive, {"reference_latents": [ref_latent]}, append=True
-            )
-            negative = node_helpers.conditioning_set_values(
-                negative,
-                {"reference_latents": [torch.zeros_like(ref_latent)]},
-                append=True,
-            )
+        # === 8. 应用 color_protect ===
+        if motion_amplitude > 1.0 and color_protect and not svi_compatible:
+            concat_latent = apply_color_protect(concat_latent, concat_latent_original)
 
-        # Reference motion from explicit reference_video (NOT from previous_video)
+        # === 9. 设置 conditioning ===
+        positive = node_helpers.conditioning_set_values(
+            positive, {"concat_latent_image": concat_latent, "concat_mask": mask}
+        )
+        negative = node_helpers.conditioning_set_values(
+            negative, {"concat_latent_image": concat_latent, "concat_mask": mask}
+        )
+
+        # === 10. 构建 reference_latents ===
+        # 使用 overlap 最后一帧作为 reference
+        last_frame = overlap_frames[-1:]
+        ref_latent = vae.encode(last_frame[:, :, :, :3])
+
+        ref_latents = [ref_latent]
+        if end_latent_cached is not None:
+            ref_latents.append(end_latent_cached)
+
+        positive = node_helpers.conditioning_set_values(
+            positive, {"reference_latents": ref_latents}, append=True
+        )
+        negative = node_helpers.conditioning_set_values(
+            negative,
+            {"reference_latents": [torch.zeros_like(r) for r in ref_latents]},
+            append=True,
+        )
+
+        # === 11. 添加 reference_motion ===
         if reference_video is not None:
             ref_motion_latent = extract_reference_motion(
                 vae, reference_video, width, height, length
@@ -211,7 +248,7 @@ class PainterI2VExtend(io.ComfyNode):
                 negative, {"reference_motion": ref_motion_latent}
             )
 
-        # CLIP vision - merge start and end if both provided
+        # === 12. 添加 clip_vision ===
         clip_vision_output = merge_clip_vision_outputs(
             clip_vision_start, clip_vision_end
         )
@@ -219,165 +256,3 @@ class PainterI2VExtend(io.ComfyNode):
 
         out_latent = {"samples": latent}
         return io.NodeOutput(positive, negative, out_latent)
-
-    @classmethod
-    def _apply_extend_conditioning(
-        cls,
-        positive,
-        negative,
-        vae,
-        overlap_frames,
-        width,
-        height,
-        length,
-        spacial_scale,
-        latent_frames,
-        motion_amplitude,
-        svi_compatible=False,
-    ):
-        """
-        Standard extend mode with AUTO_CONTINUE mechanism.
-
-        Fills overlap_frames at the beginning of the sequence and hard-locks them (mask=0).
-        This ensures motion continuity at the junction point.
-        """
-        num_overlap = overlap_frames.shape[0]
-        motion_latent_frames = ((num_overlap - 1) // 4) + 1
-
-        if svi_compatible:
-            # SVI mode: latents_mean padding
-            concat_latent_image = get_svi_padding_latent(
-                batch_size=1,
-                latent_channels=16,
-                latent_frames=latent_frames,
-                height=height,
-                width=width,
-                spacial_scale=spacial_scale,
-                device=overlap_frames.device,
-            )
-            # Encode overlap frames and insert at beginning
-            overlap_latent = vae.encode(overlap_frames[:, :, :, :3])
-            concat_latent_image[:, :, :motion_latent_frames] = overlap_latent[
-                :, :, :motion_latent_frames
-            ]
-        else:
-            # Standard mode: build image sequence with overlap frames at beginning
-            image_seq = (
-                torch.ones(
-                    (length, height, width, overlap_frames.shape[-1]),
-                    device=overlap_frames.device,
-                    dtype=overlap_frames.dtype,
-                )
-                * 0.5
-            )
-            # Fill overlap frames at the beginning
-            image_seq[:num_overlap] = overlap_frames
-            concat_latent_image = vae.encode(image_seq[:, :, :, :3])
-
-        # Create mask: hard-lock the overlap region (mask=0)
-        mask = torch.ones(
-            (1, 4, latent_frames, height // spacial_scale, width // spacial_scale),
-            device=overlap_frames.device,
-            dtype=overlap_frames.dtype,
-        )
-        # Lock the motion_frames region
-        mask[:, :, :motion_latent_frames] = 0.0
-
-        # Motion amplitude enhancement (apply only to non-locked region)
-        if motion_amplitude > 1.0 and not svi_compatible:
-            concat_latent_image = apply_motion_amplitude(
-                concat_latent_image,
-                base_frame_idx=num_overlap - 1,  # Use last overlap frame as base
-                amplitude=motion_amplitude,
-                protect_brightness=True,
-            )
-
-        # Inject conditioning
-        positive = node_helpers.conditioning_set_values(
-            positive, {"concat_latent_image": concat_latent_image, "concat_mask": mask}
-        )
-        negative = node_helpers.conditioning_set_values(
-            negative, {"concat_latent_image": concat_latent_image, "concat_mask": mask}
-        )
-
-        return positive, negative
-
-    @classmethod
-    def _apply_flf_extend_conditioning(
-        cls,
-        positive,
-        negative,
-        vae,
-        overlap_frames,
-        end_frame,
-        width,
-        height,
-        length,
-        spacial_scale,
-        latent_frames,
-        motion_amplitude,
-        svi_compatible=False,
-    ):
-        """
-        FLF-style extend mode with AUTO_CONTINUE mechanism.
-
-        Fills overlap_frames at the beginning + end_frame at the end.
-        Hard-locks both regions (mask=0).
-        """
-        num_overlap = overlap_frames.shape[0]
-        motion_latent_frames = ((num_overlap - 1) // 4) + 1
-
-        if svi_compatible:
-            # SVI mode: latents_mean padding
-            concat_latent_image = get_svi_padding_latent(
-                batch_size=1,
-                latent_channels=16,
-                latent_frames=latent_frames,
-                height=height,
-                width=width,
-                spacial_scale=spacial_scale,
-            )
-            # Encode and insert overlap frames at beginning
-            overlap_latent = vae.encode(overlap_frames[:, :, :, :3])
-            concat_latent_image[:, :, :motion_latent_frames] = overlap_latent[
-                :, :, :motion_latent_frames
-            ]
-            # Encode and insert end frame
-            end_latent = vae.encode(end_frame[:, :, :, :3])
-            concat_latent_image[:, :, -1:] = end_latent
-        else:
-            # Standard mode: build image sequence
-            image_seq = (
-                torch.ones(
-                    (length, height, width, 3),
-                    device=mm.intermediate_device(),
-                    dtype=torch.float32,
-                )
-                * 0.5
-            )
-            # Fill overlap frames at the beginning
-            image_seq[:num_overlap] = overlap_frames[:, :, :, :3]
-            # Fill end frame
-            image_seq[-1] = end_frame[0, :, :, :3]
-            concat_latent_image = vae.encode(image_seq)
-
-        # Create mask: hard-lock overlap region + end frame
-        mask = torch.ones(
-            (1, 4, latent_frames, height // spacial_scale, width // spacial_scale),
-            device=concat_latent_image.device,
-            dtype=concat_latent_image.dtype,
-        )
-        # Lock the motion_frames region at start
-        mask[:, :, :motion_latent_frames] = 0.0
-        # Lock the end frame
-        mask[:, :, -1:] = 0.0
-
-        # Inject conditioning
-        positive = node_helpers.conditioning_set_values(
-            positive, {"concat_latent_image": concat_latent_image, "concat_mask": mask}
-        )
-        negative = node_helpers.conditioning_set_values(
-            negative, {"concat_latent_image": concat_latent_image, "concat_mask": mask}
-        )
-
-        return positive, negative

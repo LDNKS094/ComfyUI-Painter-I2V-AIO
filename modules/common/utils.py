@@ -10,67 +10,7 @@ import comfy.utils
 import comfy.clip_vision
 import comfy.latent_formats
 import comfy.model_management as mm
-
-
-def create_video_mask(
-    latent_frames: int,
-    height: int,
-    width: int,
-    spacial_scale: int,
-    anchor_start: bool = False,
-    anchor_end: bool = False,
-    device=None,
-) -> torch.Tensor:
-    """
-    Create concat_mask for video conditioning with sub-frame precision.
-
-    Uses [1, 4, T, H, W] format for consistent behavior across all modes.
-    This matches the official WanFirstLastFrameToVideo implementation.
-
-    Anchor behavior:
-    - Start anchor: locks ALL 4 sub-frames of first latent frame (strong anchoring)
-    - End anchor: locks ONLY the last sub-frame of last latent frame (smooth transition)
-
-    Args:
-        latent_frames: Number of latent frames
-        height: Image height
-        width: Image width
-        spacial_scale: VAE spatial compression factor (typically 8)
-        anchor_start: If True, lock first frame (all 4 sub-frames)
-        anchor_end: If True, lock last frame (only last sub-frame)
-        device: Target device
-
-    Returns:
-        mask tensor of shape [1, 4, latent_frames, H//scale, W//scale]
-        Values: 0 = anchor (locked), 1 = generate
-    """
-    if device is None:
-        device = mm.intermediate_device()
-
-    H = height // spacial_scale
-    W = width // spacial_scale
-
-    # Create mask at image-frame level (4x temporal resolution)
-    mask = torch.ones(
-        (1, 1, latent_frames * 4, H, W),
-        device=device,
-        dtype=torch.float32,
-    )
-
-    if anchor_start:
-        # Lock first 4 positions = all 4 sub-frames of first latent frame
-        mask[:, :, :4] = 0.0
-
-    if anchor_end:
-        # Lock only last 1 position = last sub-frame of last latent frame
-        mask[:, :, -1:] = 0.0
-
-    # Reshape to [1, 4, latent_frames, H, W]
-    # view: [1, 1, T*4, H, W] -> [1, T, 4, H, W]
-    # transpose: [1, T, 4, H, W] -> [1, 4, T, H, W]
-    mask = mask.view(1, latent_frames, 4, H, W).transpose(1, 2)
-
-    return mask
+import node_helpers
 
 
 def apply_motion_amplitude(
@@ -252,36 +192,34 @@ def merge_clip_vision_outputs(*outputs):
     )
 
     merged = comfy.clip_vision.Output()
-    merged.penultimate_hidden_states = states
+    setattr(merged, "penultimate_hidden_states", states)
 
     return merged
 
 
-def apply_clip_vision(clip_vision_output, *conditionings):
+def apply_clip_vision(clip_vision_output, positive, negative):
     """
-    Apply CLIP vision output to multiple conditioning tensors.
+    Apply CLIP vision output to positive and negative conditioning.
 
     Args:
         clip_vision_output: CLIP vision output object (can be None)
-        *conditionings: Conditioning tensors to apply CLIP vision to
+        positive: Positive conditioning tensor
+        negative: Negative conditioning tensor
 
     Returns:
-        Tuple of modified conditioning tensors (same order as input)
+        Tuple of (positive, negative) conditioning tensors
     """
-    import node_helpers
-
     if clip_vision_output is None:
-        return conditionings if len(conditionings) > 1 else conditionings[0]
+        return positive, negative
 
-    results = []
-    for cond in conditionings:
-        results.append(
-            node_helpers.conditioning_set_values(
-                cond, {"clip_vision_output": clip_vision_output}
-            )
-        )
+    positive = node_helpers.conditioning_set_values(
+        positive, {"clip_vision_output": clip_vision_output}
+    )
+    negative = node_helpers.conditioning_set_values(
+        negative, {"clip_vision_output": clip_vision_output}
+    )
 
-    return tuple(results) if len(results) > 1 else results[0]
+    return positive, negative
 
 
 def get_svi_padding_latent(
@@ -326,3 +264,66 @@ def get_svi_padding_latent(
 
     # process_out converts to latents_mean
     return comfy.latent_formats.Wan21().process_out(zeros)
+
+
+def apply_color_protect(
+    enhanced_latent: torch.Tensor,
+    original_latent: torch.Tensor,
+    correct_strength: float = 0.01,
+    drift_threshold: float = 0.18,
+    brightness_threshold: float = 0.92,
+) -> torch.Tensor:
+    """
+    Apply color drift protection to enhanced latent.
+
+    Detects channels with significant mean drift and applies gentle correction.
+    Also protects brightness for dark regions.
+
+    Args:
+        enhanced_latent: Latent tensor after motion_amplitude enhancement [B, C, T, H, W]
+        original_latent: Original latent tensor before enhancement
+        correct_strength: Correction strength (default 0.01)
+        drift_threshold: Channel mean drift threshold to trigger correction (default 0.18)
+        brightness_threshold: Brightness ratio threshold to trigger boost (default 0.92)
+
+    Returns:
+        Color-protected latent tensor
+    """
+    if correct_strength <= 0:
+        return enhanced_latent
+
+    # Clone to avoid modifying input
+    result = enhanced_latent.clone()
+
+    orig_mean = original_latent.mean(dim=(2, 3, 4))
+    enhanced_mean = result.mean(dim=(2, 3, 4))
+
+    mean_drift = torch.abs(enhanced_mean - orig_mean) / (torch.abs(orig_mean) + 1e-6)
+    problem_channels = mean_drift > drift_threshold
+
+    if problem_channels.any():
+        drift_amount = enhanced_mean - orig_mean
+        correction = drift_amount * problem_channels.float() * correct_strength * 0.03
+
+        for b in range(result.shape[0]):
+            for c in range(result.shape[1]):
+                if correction[b, c].abs() > 0:
+                    result[b, c] = torch.where(
+                        result[b, c] > 0,
+                        result[b, c] - correction[b, c],
+                        result[b, c],
+                    )
+
+    # Brightness protection
+    orig_brightness = original_latent.mean()
+    enhanced_brightness = result.mean()
+
+    if enhanced_brightness < orig_brightness * brightness_threshold:
+        brightness_boost = min(orig_brightness / (enhanced_brightness + 1e-6), 1.05)
+        result = torch.where(
+            result < 0.5,
+            result * brightness_boost,
+            result,
+        )
+
+    return torch.clamp(result, -6, 6)
