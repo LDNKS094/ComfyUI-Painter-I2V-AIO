@@ -192,6 +192,7 @@ class PainterSamplerAdvanced(io.ComfyNode):
         logger.info(
             f"Phase 2: Low-noise [{switch_at_step}→{end_at_step}]  cfg={low_cfg}"
         )
+        callback_low = latent_preview.prepare_callback(low_model, steps)
         samples_final = common_ksampler(
             low_model,
             noise_seed,
@@ -200,7 +201,7 @@ class PainterSamplerAdvanced(io.ComfyNode):
             sampler_name,
             scheduler,
             low_positive,
-            low_negative,  # 使用低噪声 conditioning
+            low_negative,
             current_latent,
             denoise=1.0,
             disable_noise=True,
@@ -208,7 +209,7 @@ class PainterSamplerAdvanced(io.ComfyNode):
             last_step=end_at_step,
             force_full_denoise=force_full_denoise,
             noise_mask=current_latent.get("noise_mask", None),
-            callback=callback,
+            callback=callback_low,
             disable_pbar=disable_pbar,
         )
 

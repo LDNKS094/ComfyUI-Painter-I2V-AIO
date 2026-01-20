@@ -180,6 +180,7 @@ class PainterSampler(io.ComfyNode):
         logger.info(
             f"Phase 2: Low-noise [{switch_at_step}→{end_at_step}]  cfg={low_cfg}"
         )
+        callback_low = latent_preview.prepare_callback(low_model, steps)
         samples_final = common_ksampler(
             low_model,
             noise_seed,
@@ -196,7 +197,7 @@ class PainterSampler(io.ComfyNode):
             last_step=end_at_step,
             force_full_denoise=force_full_denoise,
             noise_mask=current_latent.get("noise_mask", None),
-            callback=callback,
+            callback=callback_low,
             disable_pbar=disable_pbar,
         )
 
