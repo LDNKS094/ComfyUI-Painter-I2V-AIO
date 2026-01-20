@@ -38,7 +38,7 @@ All-in-One collection of Painter's ComfyUI nodes for Wan 2.2 video generation.
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/your-username/ComfyUI-PainterAIO.git
+git clone https://github.com/LDNKS094/ComfyUI-Painter-I2V-AIO.git
 ```
 
 ---

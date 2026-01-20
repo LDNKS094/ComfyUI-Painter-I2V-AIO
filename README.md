@@ -38,7 +38,7 @@ This project is based on the following open-source projects:
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/your-username/ComfyUI-PainterAIO.git
+git clone https://github.com/LDNKS094/ComfyUI-Painter-I2V-AIO.git
 ```
 
 ---
