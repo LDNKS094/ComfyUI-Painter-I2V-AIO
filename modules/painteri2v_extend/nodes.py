@@ -190,9 +190,9 @@ class PainterI2VExtend(io.ComfyNode):
         concat_latent_original = concat_latent.clone()
 
         # === 6. 构建 mask ===
+        # 硬锁定首帧，motion_frames 后续帧作为软参考（mask=1.0，由 concat_latent 提供运动信息）
         mask = torch.ones((1, 1, latent_t, H, W), device=device)
-        # 锁定 motion_frames 区域 (开头)
-        mask[:, :, :motion_latent_frames] = 0.0
+        mask[:, :, :1] = 0.0  # 只硬锁首帧
         # 锁定 end_frame (如有)
         if has_end:
             mask[:, :, -1:] = 0.0
