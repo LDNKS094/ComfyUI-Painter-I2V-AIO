@@ -68,10 +68,10 @@ class PainterI2V(io.ComfyNode):
                     tooltip="Enable color drift protection after motion amplitude enhancement.",
                 ),
                 io.Boolean.Input(
-                    "svi_compatible",
+                    "svi_mode",
                     default=False,
                     optional=True,
-                    tooltip="Enable SVI LoRA compatibility. Uses latents_mean padding instead of gray frame encoding.",
+                    tooltip="Enable SVI mode for SVI LoRA compatibility. Uses latents_mean padding instead of gray frame encoding.",
                 ),
             ],
             outputs=[
@@ -98,7 +98,7 @@ class PainterI2V(io.ComfyNode):
         end_image=None,
         reference_video=None,
         color_protect=True,
-        svi_compatible=False,
+        svi_mode=False,
     ) -> io.NodeOutput:
         device = mm.intermediate_device()
         spacial_scale = vae.spacial_compression_encode()
@@ -136,7 +136,7 @@ class PainterI2V(io.ComfyNode):
 
         # === 3. 构建 image 序列 + 编码 ===
         if has_start or has_end:
-            if svi_compatible:
+            if svi_mode:
                 # SVI 模式：用 latents_mean 填充
                 concat_latent = get_svi_padding_latent(
                     batch_size=1,
