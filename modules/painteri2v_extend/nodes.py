@@ -336,7 +336,7 @@ class PainterI2VExtend(io.ComfyNode):
 
         concat_latent = [anchor_latent, motion_latent, zero_padding]
         - anchor = anchor_image or previous_video[0]
-        - motion = previous_video[-overlap_frames:] encoded
+        - motion = last N latent frames from encoded previous_video
         - padding = latents_mean (zero-valued latent)
         """
         # Get SVI padding (latents_mean)
@@ -353,13 +353,16 @@ class PainterI2VExtend(io.ComfyNode):
         # Encode anchor frame
         anchor_latent = vae.encode(anchor_frame[:, :, :, :3])
 
-        # Extract and encode motion frames
-        motion_frames = previous_video[-overlap_frames:].clone()
-        motion_frames = comfy.utils.common_upscale(
-            motion_frames.movedim(-1, 1), width, height, "bilinear", "center"
+        # Encode entire previous_video, then extract last N latent frames
+        prev_video_resized = comfy.utils.common_upscale(
+            previous_video.movedim(-1, 1), width, height, "bilinear", "center"
         ).movedim(1, -1)
-        motion_latent = vae.encode(motion_frames[:, :, :, :3])
-        motion_latent_count = motion_latent.shape[2]
+        prev_latent = vae.encode(prev_video_resized[:, :, :, :3])
+
+        # Calculate motion_latent_count from overlap_frames (pixel frames -> latent frames)
+        motion_latent_count = ((overlap_frames - 1) // 4) + 1
+        motion_latent_count = min(motion_latent_count, prev_latent.shape[2])
+        motion_latent = prev_latent[:, :, -motion_latent_count:]
 
         # Insert anchor at position 0
         concat_latent[:, :, :1] = anchor_latent
@@ -374,7 +377,7 @@ class PainterI2VExtend(io.ComfyNode):
 
         # Build mask: only lock anchor (position 0)
         mask = torch.ones((1, 1, latent_t, H, W), device=device)
-        mask[:, :, :1] = 0.0  # Lock anchor
+        mask[:, :, :1] = 0.0
 
         # Lock end frame if provided
         if has_end:
