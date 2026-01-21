@@ -10,7 +10,6 @@ from ..common.utils import (
     apply_color_protect,
     apply_frequency_separation,
     extract_reference_motion,
-    merge_clip_vision_outputs,
     apply_clip_vision,
     get_svi_padding_latent,
 )
@@ -28,7 +27,7 @@ class PainterI2V(io.ComfyNode):
     Key features:
     - Motion amplitude enhancement to fix slow-motion issues in accelerated models
     - Frequency separation algorithm (FLF2V mode) preserves color while boosting structure
-    - Dual CLIP vision support for semantic transition guidance
+    - CLIP vision support for semantic guidance
     """
 
     @classmethod
@@ -53,8 +52,11 @@ class PainterI2V(io.ComfyNode):
                     step=0.05,
                     tooltip="1.0 = Original, 1.15 = Recommended for I2V, up to 2.0 for high-speed motion",
                 ),
-                io.ClipVisionOutput.Input("clip_vision_start", optional=True),
-                io.ClipVisionOutput.Input("clip_vision_end", optional=True),
+                io.ClipVisionOutput.Input(
+                    "clip_vision",
+                    optional=True,
+                    tooltip="CLIP vision output for semantic guidance.",
+                ),
                 io.Image.Input("start_image", optional=True),
                 io.Image.Input("end_image", optional=True),
                 io.Image.Input(
@@ -92,8 +94,7 @@ class PainterI2V(io.ComfyNode):
         length,
         batch_size,
         motion_amplitude,
-        clip_vision_start=None,
-        clip_vision_end=None,
+        clip_vision=None,
         start_image=None,
         end_image=None,
         reference_video=None,
@@ -246,10 +247,7 @@ class PainterI2V(io.ComfyNode):
             )
 
         # === 11. 添加 clip_vision ===
-        clip_vision_output = merge_clip_vision_outputs(
-            clip_vision_start, clip_vision_end
-        )
-        positive, negative = apply_clip_vision(clip_vision_output, positive, negative)
+        positive, negative = apply_clip_vision(clip_vision, positive, negative)
 
         out_latent = {"samples": latent}
         return io.NodeOutput(positive, negative, out_latent)
