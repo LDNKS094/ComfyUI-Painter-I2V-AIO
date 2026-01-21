@@ -51,12 +51,20 @@ class PainterI2VAdvanced(io.ComfyNode):
                     tooltip="Motion enhancement (high noise only).",
                 ),
                 io.Int.Input(
-                    "motion_latent_count",
-                    default=1,
+                    "overlap_frames",
+                    default=4,
                     min=1,
-                    max=11,
+                    max=41,
                     step=1,
-                    tooltip="Latent frames to extract from previous_latent end.",
+                    tooltip="Pixel frames to overlap from previous video for continuation.",
+                ),
+                io.Float.Input(
+                    "continuity_strength",
+                    default=0.1,
+                    min=0.0,
+                    max=1.0,
+                    step=0.05,
+                    tooltip="Motion frame lock strength in standard mode (0=no lock, 1=hard lock). Not used in SVI mode.",
                 ),
                 io.Float.Input(
                     "high_noise_end_strength",
@@ -98,7 +106,12 @@ class PainterI2VAdvanced(io.ComfyNode):
                 io.Latent.Input(
                     "previous_latent",
                     optional=True,
-                    tooltip="Previous video latent for continuation. Accepts empty latent for loop compatibility.",
+                    tooltip="Previous video latent for continuation (SVI mode). Accepts empty latent for loop compatibility.",
+                ),
+                io.Image.Input(
+                    "previous_image",
+                    optional=True,
+                    tooltip="Previous video frames for continuation (standard mode). Required for standard mode continuation.",
                 ),
             ],
             outputs=[
@@ -120,7 +133,8 @@ class PainterI2VAdvanced(io.ComfyNode):
         height,
         length,
         motion_amplitude=1.15,
-        motion_latent_count=1,
+        overlap_frames=4,
+        continuity_strength=0.1,
         high_noise_end_strength=1.0,
         correct_strength=0.01,
         color_protect=True,
@@ -129,6 +143,7 @@ class PainterI2VAdvanced(io.ComfyNode):
         end_image=None,
         clip_vision=None,
         previous_latent=None,
+        previous_image=None,
     ) -> io.NodeOutput:
         device = mm.intermediate_device()
         spacial_scale = vae.spacial_compression_encode()
@@ -142,20 +157,52 @@ class PainterI2VAdvanced(io.ComfyNode):
         has_start = start_image is not None
         has_end = end_image is not None
 
-        # Detect fake previous_latent (empty latent for loop compatibility)
-        has_previous = False
+        # Detect valid previous inputs
+        has_previous_latent = False
         if previous_latent is not None:
             prev_samples = previous_latent["samples"]
-            # Must be 5D video latent [B, C, T, H, W] with T > 0
             if prev_samples.ndim == 5 and prev_samples.shape[2] > 0:
-                has_previous = True
+                has_previous_latent = True
+
+        has_previous_image = previous_image is not None and previous_image.shape[0] > 0
+
+        # Validate: cannot have both previous_latent and previous_image
+        if has_previous_latent and has_previous_image:
+            raise ValueError(
+                "Cannot use both previous_latent and previous_image. "
+                "Use previous_latent for SVI mode, previous_image for standard mode."
+            )
+
+        # Auto-convert based on svi_mode
+        if svi_mode:
+            # SVI mode needs previous_latent
+            if has_previous_image and not has_previous_latent:
+                # Convert previous_image to latent
+                prev_img_resized = comfy.utils.common_upscale(
+                    previous_image.movedim(-1, 1), width, height, "bilinear", "center"
+                ).movedim(1, -1)
+                prev_latent_encoded = vae.encode(prev_img_resized[:, :, :, :3])
+                previous_latent = {"samples": prev_latent_encoded}
+                has_previous_latent = True
+                has_previous_image = False
+        else:
+            # Standard mode needs previous_image
+            if has_previous_latent and not has_previous_image:
+                # Convert previous_latent to image
+                previous_image = vae.decode(previous_latent["samples"])
+                has_previous_image = True
+                has_previous_latent = False
 
         # Cache for reference_latent (from start_image, used in low noise only)
         start_image_latent_for_ref = None
         start_latent_cached = None
         end_latent_cached = None
         motion_latent = None
-        actual_motion_count = 0
+        
+        # Convert pixel frames to latent frame index
+        overlap_latent_idx = overlap_frames // 4
+        # Number of latent frames to extract (for SVI mode motion context)
+        overlap_latent_count = ((overlap_frames - 1) // 4) + 1
 
         if has_start:
             start_image = comfy.utils.common_upscale(
@@ -171,11 +218,12 @@ class PainterI2VAdvanced(io.ComfyNode):
             ).movedim(1, -1)
             end_latent_cached = vae.encode(end_image[:, :, :, :3])
 
-        if has_previous:
+        # For SVI mode: extract motion_latent from previous_latent
+        if svi_mode and has_previous_latent:
             prev_samples = previous_latent["samples"]
-            actual_motion_count = min(motion_latent_count, prev_samples.shape[2])
-            motion_latent = prev_samples[:, :, -actual_motion_count:].clone()
-            start_latent_cached = prev_samples[:, :, -1:].clone()
+            actual_count = min(overlap_latent_count, prev_samples.shape[2])
+            motion_latent = prev_samples[:, :, -actual_count:].clone()
+            start_latent_cached = motion_latent[:, :, :1].clone()
             has_start = True
 
         if svi_mode:
@@ -183,7 +231,7 @@ class PainterI2VAdvanced(io.ComfyNode):
                 start_latent=start_latent_cached,
                 end_latent=end_latent_cached,
                 motion_latent=motion_latent,
-                actual_motion_count=actual_motion_count,
+                overlap_latent_count=overlap_latent_count,
                 has_end=has_end,
                 latent_t=latent_t,
                 latent_channels=latent_channels,
@@ -197,15 +245,13 @@ class PainterI2VAdvanced(io.ComfyNode):
         else:
             concat_high, concat_low = cls._build_standard_mode(
                 vae=vae,
-                start_image=start_image if not has_previous else None,
+                start_image=start_image if not has_previous_image else None,
                 end_image=end_image,
-                start_latent=start_latent_cached,
-                end_latent=end_latent_cached,
-                motion_latent=motion_latent,
-                actual_motion_count=actual_motion_count,
+                previous_image=previous_image,
+                overlap_frames=overlap_frames,
                 has_start=has_start,
                 has_end=has_end,
-                has_previous=has_previous,
+                has_previous_image=has_previous_image,
                 length=length,
                 height=height,
                 width=width,
@@ -230,10 +276,18 @@ class PainterI2VAdvanced(io.ComfyNode):
         mask_high = torch.ones((1, 1, latent_t, H, W), device=device)
         mask_low = torch.ones((1, 1, latent_t, H, W), device=device)
 
-        if has_start or has_previous:
+        # Frame 0: hard lock
+        if has_start or has_previous_image or has_previous_latent:
             mask_high[:, :, :1] = 0.0
             mask_low[:, :, :1] = 0.0
 
+        # In standard mode with continuation: soft lock at overlap_latent_idx
+        if not svi_mode and has_previous_image and overlap_latent_idx > 0 and overlap_latent_idx < latent_t:
+            motion_lock = max(0.0, 1.0 - continuity_strength)
+            mask_high[:, :, overlap_latent_idx:overlap_latent_idx+1] = motion_lock
+            mask_low[:, :, overlap_latent_idx:overlap_latent_idx+1] = motion_lock
+
+        # End frame lock (high noise only)
         if has_end:
             mask_high[:, :, -1:] = max(0.0, 1.0 - high_noise_end_strength)
 
@@ -282,22 +336,58 @@ class PainterI2VAdvanced(io.ComfyNode):
         vae,
         start_image,
         end_image,
-        start_latent,
-        end_latent,
-        motion_latent,
-        actual_motion_count,
+        previous_image,
+        overlap_frames,
         has_start,
         has_end,
-        has_previous,
+        has_previous_image,
         length,
         height,
         width,
         device,
     ):
+        """
+        Standard mode: Similar to Extend's Continuity mode.
+        
+        Without previous_image:
+        - Frame 0: start_image
+        - Frame -1: end_image (high only)
+        - Other frames: grey fill
+        
+        With previous_image (continuation):
+        - Frame 0: previous_image[-overlap_frames]
+        - Frame overlap_frames: previous_image[-1]
+        - Frame -1: end_image (high only)
+        - Other frames: grey fill
+        """
         image_high = torch.ones((length, height, width, 3), device=device) * 0.5
         image_low = torch.ones((length, height, width, 3), device=device) * 0.5
 
-        if start_image is not None and not has_previous:
+        if has_previous_image:
+            # Continuation mode: use previous_image frames
+            available_frames = previous_image.shape[0]
+            actual_overlap = min(overlap_frames, available_frames)
+            
+            # Start frame: previous_image[-overlap_frames]
+            start_idx = max(0, available_frames - actual_overlap)
+            start_frame = previous_image[start_idx:start_idx+1].clone()
+            start_frame = comfy.utils.common_upscale(
+                start_frame.movedim(-1, 1), width, height, "bilinear", "center"
+            ).movedim(1, -1)
+            image_high[0] = start_frame[0, :, :, :3]
+            image_low[0] = start_frame[0, :, :, :3]
+            
+            # Middle frame: previous_image[-1] at position overlap_frames
+            middle_idx = min(overlap_frames, length - 1)
+            if middle_idx > 0:
+                middle_frame = previous_image[-1:].clone()
+                middle_frame = comfy.utils.common_upscale(
+                    middle_frame.movedim(-1, 1), width, height, "bilinear", "center"
+                ).movedim(1, -1)
+                image_high[middle_idx] = middle_frame[0, :, :, :3]
+                image_low[middle_idx] = middle_frame[0, :, :, :3]
+        elif start_image is not None:
+            # First generation mode: use start_image
             image_high[0] = start_image[0, :, :, :3]
             image_low[0] = start_image[0, :, :, :3]
 
@@ -307,10 +397,6 @@ class PainterI2VAdvanced(io.ComfyNode):
         concat_high = vae.encode(image_high)
         concat_low = vae.encode(image_low)
 
-        if motion_latent is not None:
-            concat_high[:, :, :actual_motion_count] = motion_latent
-            concat_low[:, :, :actual_motion_count] = motion_latent
-
         return concat_high, concat_low
 
     @classmethod
@@ -319,7 +405,7 @@ class PainterI2VAdvanced(io.ComfyNode):
         start_latent,
         end_latent,
         motion_latent,
-        actual_motion_count,
+        overlap_latent_count,
         has_end,
         latent_t,
         latent_channels,
@@ -357,7 +443,7 @@ class PainterI2VAdvanced(io.ComfyNode):
             concat_high[:, :, -1:] = end_latent
 
         if motion_latent is not None:
-            concat_high[:, :, :actual_motion_count] = motion_latent
-            concat_low[:, :, :actual_motion_count] = motion_latent
+            concat_high[:, :, :overlap_latent_count] = motion_latent
+            concat_low[:, :, :overlap_latent_count] = motion_latent
 
         return concat_high, concat_low
