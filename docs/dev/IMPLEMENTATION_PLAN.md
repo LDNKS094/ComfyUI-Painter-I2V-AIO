@@ -212,7 +212,18 @@ motion_latent = previous_encoded[:, :, -context_latent_count:]
 - 全功能节点，4 cond 输出
 - 高/低噪分离，精细控制
 - 支持无损 latent 续接（直接输入 `previous_latent`）
-- 叠加多种优秀特性（不使用显式模式切换）
+- 完全覆盖 PainterI2V 和 PainterI2VExtend 的所有场景
+
+### 四种场景
+
+| 场景 | svi_mode | previous_latent | 机制 |
+|------|----------|-----------------|------|
+| 标准初始生成 | False | None | 灰色填充 + start/end image 编码 |
+| 标准视频延续 | False | 有 | motion latent 注入到 concat_latent 开头 |
+| SVI 初始生成 | True | None | 零填充(latents_mean) + anchor 编码 |
+| SVI 视频延续 | True | 有 | [anchor, motion, padding] 结构 |
+
+**与 Extend 节点的区别**：Advanced 直接接收 `previous_latent`（已编码），无需 VAE encode。
 
 ### 输入
 
@@ -229,21 +240,21 @@ motion_latent = previous_encoded[:, :, -context_latent_count:]
 |------|------|--------|------|
 | width / height | INT | 832 / 480 | |
 | length | INT | 81 | 生成帧数 |
-| motion_amplitude | FLOAT | 1.15 | 动作幅度增强 |
+| motion_amplitude | FLOAT | 1.15 | 动作幅度增强（仅高噪） |
 | motion_latent_count | INT | 1 | 从 previous_latent 末端取多少帧 |
 | correct_strength | FLOAT | 0.01 | 色彩校正强度 |
-| color_protect | BOOLEAN | True | 启用色彩保护 |
+| color_protect | BOOLEAN | True | 启用色彩保护（仅高噪） |
 | svi_mode | BOOLEAN | False | SVI LoRA 兼容模式 |
 
 #### 可选连接
 
 | 参数 | 类型 | 说明 |
 |------|------|------|
-| start_image | IMAGE | 首帧 |
+| start_image | IMAGE | 首帧（被 previous_latent 覆盖） |
 | end_image | IMAGE | 尾帧 |
 | clip_vision | CLIP_VISION_OUTPUT | 语义引导 |
 | previous_latent | LATENT | 前置 latent（无损续接） |
-| reference_latent | LATENT | 风格参考（任意数量） |
+| reference_latent | LATENT | 外部风格参考（低噪优先使用） |
 
 ### 输出
 
@@ -253,80 +264,81 @@ motion_latent = previous_encoded[:, :, -context_latent_count:]
 | low_positive / low_negative | CONDITIONING |
 | latent | LATENT |
 
-### 核心设计：锁定策略
+### 核心设计
 
-**mask 共用，concat_latent 因 motion_amplitude 增强而分离。**
+#### 1. concat_latent 构建
 
-#### 锁定策略
-
-| 区域 | 锁定方式 | mask 值 | 说明 |
-|------|----------|---------|------|
-| 首帧 (position 0) | **硬锁定** | 0.0 | previous_latent 覆盖 start_image |
-| motion_latent (position 1~N) | **软锁定** | 1.0 | 仅注入 concat_latent，不锁定 mask |
-| 尾帧 (position -1) | **硬锁定** | 0.0 | end_image 锁定 |
-| 中间区域 | 生成 | 1.0 | 由模型自由生成 |
-
-#### previous_latent 覆盖规则
-
+**标准模式 (svi_mode=False)**：
 ```python
-if previous_latent is not None:
-    # 覆盖模式：motion_latent 从 previous_latent 末端获取
-    motion_latent = previous_latent["samples"][:, :, -motion_latent_count:]
-    concat_latent[:, :, :motion_latent_count] = motion_latent
-    mask[:, :, :1] = 0.0  # 只硬锁首帧
-    # start_image 被忽略
-else:
-    # 首发模式：start_image 在 position 0
-    if start_image is not None:
-        image[0] = start_image[0]
-        mask[:, :, :1] = 0.0  # 锁定首帧
+# 初始生成：灰色填充 + 锚点图像
+image = gray_fill(length)
+image[0] = start_image
+image[-1] = end_image
+concat_latent = vae.encode(image)
+
+# 视频延续：注入 motion latent
+motion_latent = previous_latent[:, :, -motion_latent_count:]
+concat_latent[:, :, :motion_latent_count] = motion_latent
 ```
 
-#### 高/低噪分离机制
+**SVI 模式 (svi_mode=True)**：
+```python
+# 初始生成：零填充 + anchor
+concat_latent = get_svi_padding_latent()  # latents_mean
+concat_latent[:, :, :1] = start_latent
 
-| 组件 | 高噪 | 低噪 | 说明 |
-|------|------|------|------|
-| mask | 共用 | 共用 | 首尾硬锁，中间软锁 |
-| concat_latent | **增强版** | **原始版** | motion_amplitude + color_protect 仅高噪 |
-| reference_latent | 自动生成 | 外部优先 | 无外部输入时复用高噪 |
+# 视频延续：[anchor, motion, padding]
+anchor = previous_latent[:, :, :1]
+motion = previous_latent[:, :, -motion_latent_count:]
+concat_latent[:, :, :1] = anchor
+concat_latent[:, :, 1:1+motion_latent_count] = motion
+```
 
-#### concat_latent 分离流程
+#### 2. mask 策略（高/低噪共用）
+
+| 区域 | mask 值 | 说明 |
+|------|---------|------|
+| 首帧 | 0.0 | 硬锁定 |
+| motion 区域 | 1.0 | 软锁定（仅 concat_latent 注入） |
+| 尾帧 | 0.0 | 硬锁定（如有 end_image） |
+| 其他 | 1.0 | 自由生成 |
+
+#### 3. 高/低噪分离
+
+| 组件 | 高噪 | 低噪 |
+|------|------|------|
+| concat_latent | 增强版（motion_amplitude + color_protect） | 原始版 |
+| mask | 共用 | 共用 |
+| reference_latent | 自动生成（start + end） | 外部优先，无则复用高噪 |
+
+#### 4. 处理流程
 
 ```
-concat_latent_base = vae.encode(image)  # 基础编码
+concat_latent = build_based_on_mode()
     ↓
-注入 motion_latent (if previous_latent)
+inject_motion_latent() (if previous_latent)
     ↓
-concat_latent_original = clone()  ──────────────────→ 低噪使用
+concat_latent_original = clone()  ────────→ 低噪
     ↓
 apply_motion_amplitude() (if > 1.0)
     ↓
 apply_color_protect() (if enabled)
     ↓
-concat_latent_enhanced  ────────────────────────────→ 高噪使用
+concat_latent_enhanced  ──────────────────→ 高噪
 ```
-
-#### Reference Latent 逻辑
-
-| 阶段 | reference_latent 来源 |
-|------|----------------------|
-| 高噪 | 自动生成：首帧 + previous_latent[-1] + end_image |
-| 低噪 (有外部输入) | 仅使用外部 reference_latent |
-| 低噪 (无外部输入) | 复用高噪的 reference |
 
 ### 来源整合
 
-- **PainterI2VAdvanced**: motion_amplitude 增强 + color_protect
-- **Wan22FMLF SVI**: previous_latent 无损续接 + motion_latent 软锁定
+- **PainterI2VAdvanced**: motion_amplitude + color_protect + 高低噪分离
+- **Wan22FMLF SVI**: previous_latent 无损续接
+- **PainterI2VExtend**: 双模式设计思路
 
 ### 设计要点
 
 1. **4 cond 输出**：需配合 PainterSamplerAdvanced
-2. **高/低噪共用 concat_latent + mask**：简化逻辑
-3. **首尾硬锁 + 中间软锁**：与 Wan22FMLF SVI 一致
-4. **previous_latent 覆盖 start_image**：续接场景下忽略 start_image
-5. **reference_latent 自动管理**：高噪从锚点图自动生成，低噪优先外部输入
-6. **无需 context_latent_count**：直接从 previous_latent 末端获取，无需额外编码
+2. **previous_latent 覆盖 start_image**：续接场景下 start_image 被忽略
+3. **无需 context_latent_count**：直接从 previous_latent 末端获取
+4. **SVI 模式差异**：使用 [anchor, motion, padding] 结构
 
 ---
 
@@ -343,5 +355,5 @@ concat_latent_enhanced  ──────────────────�
 
 1. ~~PainterI2V~~ ✅
 2. ~~PainterI2V Extend~~ ✅ (双模式已实现)
-3. 🔄 PainterI2V Advanced 重构（特性叠加设计）
+3. ~~PainterI2V Advanced~~ ✅ (四场景 + 高低噪分离)
 4. 测试 + 调优
