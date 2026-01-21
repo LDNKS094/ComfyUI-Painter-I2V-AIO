@@ -10,7 +10,7 @@ from comfy_api.latest import io
 logger = logging.getLogger("Comfyui-PainterSampler")
 
 
-# 官方 common_ksampler 副本（保持原样）
+# 官方 common_ksampler 修改版（添加 callback 参数支持双阶段采样）
 def common_ksampler(
     model,
     seed,
@@ -26,7 +26,6 @@ def common_ksampler(
     start_step=None,
     last_step=None,
     force_full_denoise=True,
-    noise_mask=None,
     callback=None,
     disable_pbar=False,
 ):
@@ -168,7 +167,6 @@ class PainterSampler(io.ComfyNode):
                 start_step=start_at_step,
                 last_step=switch_at_step,
                 force_full_denoise=False,
-                noise_mask=latent_image.get("noise_mask", None),
                 callback=callback,
                 disable_pbar=disable_pbar,
             )
@@ -196,7 +194,6 @@ class PainterSampler(io.ComfyNode):
             start_step=switch_at_step,
             last_step=end_at_step,
             force_full_denoise=force_full_denoise,
-            noise_mask=current_latent.get("noise_mask", None),
             callback=callback_low,
             disable_pbar=disable_pbar,
         )

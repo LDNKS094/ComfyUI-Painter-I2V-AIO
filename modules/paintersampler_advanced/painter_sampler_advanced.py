@@ -25,11 +25,9 @@ def common_ksampler(
     start_step=None,
     last_step=None,
     force_full_denoise=True,
-    noise_mask=None,
     callback=None,
     disable_pbar=False,
 ):
-    """Standard ksampler implementation"""
     latent_image = latent["samples"]
     latent_image = comfy.sample.fix_empty_latent_channels(model, latent_image)
     if disable_noise:
@@ -173,14 +171,13 @@ class PainterSamplerAdvanced(io.ComfyNode):
                 sampler_name,
                 scheduler,
                 high_positive,
-                high_negative,  # 使用高噪声 conditioning
+                high_negative,
                 latent_stage1,
                 denoise=1.0,
                 disable_noise=disable_noise,
                 start_step=start_at_step,
                 last_step=switch_at_step,
                 force_full_denoise=False,
-                noise_mask=latent_image.get("noise_mask", None),
                 callback=callback,
                 disable_pbar=disable_pbar,
             )
@@ -208,7 +205,6 @@ class PainterSamplerAdvanced(io.ComfyNode):
             start_step=switch_at_step,
             last_step=end_at_step,
             force_full_denoise=force_full_denoise,
-            noise_mask=current_latent.get("noise_mask", None),
             callback=callback_low,
             disable_pbar=disable_pbar,
         )

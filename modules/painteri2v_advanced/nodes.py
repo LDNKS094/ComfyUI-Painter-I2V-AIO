@@ -146,8 +146,8 @@ class PainterI2VAdvanced(io.ComfyNode):
         has_previous = False
         if previous_latent is not None:
             prev_samples = previous_latent["samples"]
-            # Check if it's a real latent (has temporal frames)
-            if prev_samples.numel() > 0 and prev_samples.shape[2] > 0:
+            # Must be 5D video latent [B, C, T, H, W] with T > 0
+            if prev_samples.ndim == 5 and prev_samples.shape[2] > 0:
                 has_previous = True
 
         # Cache for reference_latent (from start_image, used in low noise only)
