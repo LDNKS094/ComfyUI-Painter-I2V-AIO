@@ -2,39 +2,40 @@
 """
 PainterI2V Extend - Video Continuation Node
 
-Specialized for extending/continuing videos from a previous segment.
-Uses motion_frames overlap for smooth transitions.
+Dual-mode design:
+- CONTINUITY mode (svi_mode=False): Start-middle frame linking for native I2V
+- SVI mode (svi_mode=True): SVI 2.0 Pro architecture for SVI LoRA
 
-SOURCE TRACKING: Based on ComfyUI-PainterLongVideo, refactored for new API
+SOURCE TRACKING: Based on ComfyUI-PainterLongVideo + Start-Middle Continuity discovery
 """
 
 import torch
 import comfy.model_management as mm
 import comfy.utils
-import comfy.latent_formats
 import node_helpers
 from comfy_api.latest import io
 
 from ..common.utils import (
     apply_motion_amplitude,
     apply_color_protect,
-    extract_reference_motion,
-    merge_clip_vision_outputs,
-    apply_clip_vision,
     get_svi_padding_latent,
 )
 
 
 class PainterI2VExtend(io.ComfyNode):
     """
-    Video continuation node for extending previous video segments.
+    Video continuation node with dual-mode support.
 
-    Key features:
-    - motion_frames overlap for smooth transitions
-    - Automatic reference_latents from previous_video last frame
-    - Optional end_image for FLF-style continuation
-    - Optional reference_video for motion guidance (explicit, not from previous_video)
-    - SVI LoRA compatibility mode
+    Modes:
+    - CONTINUITY (svi_mode=False): Start-middle frame linking
+      - start = previous_video[-overlap_frames]
+      - middle = previous_video[-1] at position overlap_frames
+      - Auto-calculated middle_strength to avoid gray artifacts
+
+    - SVI (svi_mode=True): SVI 2.0 Pro architecture
+      - anchor = anchor_image or previous_video[0]
+      - motion = previous_video[-overlap_frames:] encoded
+      - zero_padding with latents_mean
     """
 
     @classmethod
@@ -51,47 +52,49 @@ class PainterI2VExtend(io.ComfyNode):
                 io.Int.Input("height", default=480, min=16, max=4096, step=16),
                 io.Int.Input("length", default=81, min=1, max=4096, step=4),
                 io.Int.Input("batch_size", default=1, min=1, max=4096),
+                io.Image.Input(
+                    "previous_video",
+                    tooltip="Previous video segment (required).",
+                ),
+                io.Int.Input(
+                    "overlap_frames",
+                    default=4,
+                    min=4,
+                    max=8,
+                    tooltip="Overlap frames for continuity. Controls start/middle positions (CONTINUITY) or motion frames (SVI).",
+                ),
                 io.Float.Input(
                     "motion_amplitude",
                     default=1.15,
                     min=1.0,
                     max=2.0,
                     step=0.05,
-                    tooltip="1.0 = Original, 1.15 = Recommended, up to 2.0 for high-speed motion",
-                ),
-                io.ClipVisionOutput.Input("clip_vision_start", optional=True),
-                io.ClipVisionOutput.Input("clip_vision_end", optional=True),
-                io.Image.Input(
-                    "previous_video",
-                    tooltip="Previous video segment (required). Last frame used as anchor.",
-                ),
-                io.Int.Input(
-                    "motion_frames",
-                    default=5,
-                    min=1,
-                    max=20,
-                    tooltip="Number of overlap frames from previous_video for motion continuity.",
-                ),
-                io.Image.Input(
-                    "end_image",
-                    optional=True,
-                    tooltip="Optional target end frame for FLF-style continuation.",
-                ),
-                io.Image.Input(
-                    "reference_video",
-                    optional=True,
-                    tooltip="Optional reference video for motion guidance. NOT extracted from previous_video.",
+                    tooltip="Motion enhancement. Only applies in CONTINUITY mode.",
                 ),
                 io.Boolean.Input(
                     "color_protect",
                     default=True,
-                    tooltip="Enable color drift protection after motion amplitude enhancement.",
+                    tooltip="Color drift protection. Only applies in CONTINUITY mode.",
                 ),
                 io.Boolean.Input(
-                    "svi_compatible",
+                    "svi_mode",
                     default=False,
+                    tooltip="Enable SVI mode for SVI LoRA compatibility.",
+                ),
+                io.Image.Input(
+                    "anchor_image",
                     optional=True,
-                    tooltip="Enable SVI LoRA compatibility. Uses latents_mean padding.",
+                    tooltip="Style anchor + reference_latent source. Defaults to previous_video[0].",
+                ),
+                io.Image.Input(
+                    "end_image",
+                    optional=True,
+                    tooltip="Target end frame (locked).",
+                ),
+                io.ClipVisionOutput.Input(
+                    "clip_vision",
+                    optional=True,
+                    tooltip="CLIP vision output for semantic guidance.",
                 ),
             ],
             outputs=[
@@ -111,15 +114,14 @@ class PainterI2VExtend(io.ComfyNode):
         height,
         length,
         batch_size,
-        motion_amplitude,
         previous_video,
-        clip_vision_start=None,
-        clip_vision_end=None,
-        motion_frames=5,
-        end_image=None,
-        reference_video=None,
+        overlap_frames=4,
+        motion_amplitude=1.15,
         color_protect=True,
-        svi_compatible=False,
+        svi_mode=False,
+        anchor_image=None,
+        end_image=None,
+        clip_vision=None,
     ) -> io.NodeOutput:
         device = mm.intermediate_device()
         spacial_scale = vae.spacial_compression_encode()
@@ -128,89 +130,88 @@ class PainterI2VExtend(io.ComfyNode):
         H = height // spacial_scale
         W = width // spacial_scale
 
-        # === 1. 初始化输出 latent ===
+        # Initialize output latent
         latent = torch.zeros(
             [batch_size, latent_channels, latent_t, H, W], device=device
         )
 
-        # === 2. 提取 overlap_frames + upscale ===
-        actual_motion_frames = min(motion_frames, previous_video.shape[0], length - 1)
-        if actual_motion_frames < 1:
-            actual_motion_frames = 1
+        # Validate overlap_frames
+        overlap_frames = min(overlap_frames, previous_video.shape[0] - 1, length - 4)
+        overlap_frames = max(4, overlap_frames)
 
-        overlap_frames = previous_video[-actual_motion_frames:].clone()
-        overlap_frames = comfy.utils.common_upscale(
-            overlap_frames.movedim(-1, 1), width, height, "bilinear", "center"
-        ).movedim(1, -1)
-
-        num_overlap = overlap_frames.shape[0]
-        motion_latent_frames = ((num_overlap - 1) // 4) + 1
-
-        # === 3. 预处理 end_image (如有) + 缓存编码 ===
+        # Preprocess end_image if provided
         has_end = end_image is not None
         end_latent_cached = None
-
         if has_end:
-            end_image = comfy.utils.common_upscale(
+            end_image_resized = comfy.utils.common_upscale(
                 end_image[-1:].movedim(-1, 1), width, height, "bilinear", "center"
             ).movedim(1, -1)
-            end_latent_cached = vae.encode(end_image[:, :, :, :3])
+            end_latent_cached = vae.encode(end_image_resized[:, :, :, :3])
 
-        # === 4. 构建 image 序列 + 编码 ===
-        if svi_compatible:
-            # SVI 模式：用 latents_mean 填充
-            concat_latent = get_svi_padding_latent(
-                batch_size=1,
-                latent_channels=latent_channels,
-                latent_frames=latent_t,
-                height=height,
+        # Get anchor frame (for reference_latents)
+        if anchor_image is not None:
+            anchor_frame = comfy.utils.common_upscale(
+                anchor_image[:1].movedim(-1, 1), width, height, "bilinear", "center"
+            ).movedim(1, -1)
+        else:
+            anchor_frame = comfy.utils.common_upscale(
+                previous_video[:1].movedim(-1, 1), width, height, "bilinear", "center"
+            ).movedim(1, -1)
+
+        if svi_mode:
+            # ===== SVI MODE =====
+            concat_latent, mask = cls._build_svi_mode(
+                vae=vae,
+                previous_video=previous_video,
+                anchor_frame=anchor_frame,
+                overlap_frames=overlap_frames,
+                end_latent_cached=end_latent_cached,
+                has_end=has_end,
                 width=width,
+                height=height,
+                length=length,
+                latent_t=latent_t,
+                latent_channels=latent_channels,
                 spacial_scale=spacial_scale,
+                H=H,
+                W=W,
                 device=device,
             )
-            # 编码 overlap 并插入开头
-            overlap_latent = vae.encode(overlap_frames[:, :, :, :3])
-            concat_latent[:, :, :motion_latent_frames] = overlap_latent[
-                :, :, :motion_latent_frames
-            ]
-            # 插入 end_image (如有)
-            if has_end and end_latent_cached is not None:
-                concat_latent[:, :, -1:] = end_latent_cached
+            concat_latent_original = concat_latent  # No enhancement in SVI mode
         else:
-            # 标准模式：灰色填充
-            image = torch.ones((length, height, width, 3), device=device) * 0.5
-            # 填充 overlap frames 到开头
-            image[:num_overlap] = overlap_frames[:, :, :, :3]
-            # 填充 end_image (如有)
-            if has_end:
-                image[-1] = end_image[0, :, :, :3]
-            concat_latent = vae.encode(image)
-
-        # === 5. 保存原始 concat_latent ===
-        concat_latent_original = concat_latent.clone()
-
-        # === 6. 构建 mask ===
-        # 硬锁定首帧，motion_frames 后续帧作为软参考（mask=1.0，由 concat_latent 提供运动信息）
-        mask = torch.ones((1, 1, latent_t, H, W), device=device)
-        mask[:, :, :1] = 0.0  # 只硬锁首帧
-        # 锁定 end_frame (如有)
-        if has_end:
-            mask[:, :, -1:] = 0.0
-
-        # === 7. 应用 motion_amplitude ===
-        if motion_amplitude > 1.0 and not svi_compatible:
-            concat_latent = apply_motion_amplitude(
-                concat_latent,
-                base_frame_idx=num_overlap - 1,  # 用最后一个 overlap frame 作为基准
-                amplitude=motion_amplitude,
-                protect_brightness=True,
+            # ===== CONTINUITY MODE =====
+            concat_latent, mask = cls._build_continuity_mode(
+                vae=vae,
+                previous_video=previous_video,
+                overlap_frames=overlap_frames,
+                end_latent_cached=end_latent_cached,
+                has_end=has_end,
+                width=width,
+                height=height,
+                length=length,
+                latent_t=latent_t,
+                H=H,
+                W=W,
+                device=device,
             )
+            concat_latent_original = concat_latent.clone()
 
-        # === 8. 应用 color_protect ===
-        if motion_amplitude > 1.0 and color_protect and not svi_compatible:
-            concat_latent = apply_color_protect(concat_latent, concat_latent_original)
+            # Apply motion_amplitude (CONTINUITY only)
+            if motion_amplitude > 1.0:
+                concat_latent = apply_motion_amplitude(
+                    concat_latent,
+                    base_frame_idx=0,  # Use start frame as base
+                    amplitude=motion_amplitude,
+                    protect_brightness=True,
+                )
 
-        # === 9. 设置 conditioning ===
+            # Apply color_protect (CONTINUITY only)
+            if motion_amplitude > 1.0 and color_protect:
+                concat_latent = apply_color_protect(
+                    concat_latent, concat_latent_original
+                )
+
+        # Set conditioning
         positive = node_helpers.conditioning_set_values(
             positive, {"concat_latent_image": concat_latent, "concat_mask": mask}
         )
@@ -218,11 +219,8 @@ class PainterI2VExtend(io.ComfyNode):
             negative, {"concat_latent_image": concat_latent, "concat_mask": mask}
         )
 
-        # === 10. 构建 reference_latents ===
-        # 使用 overlap 最后一帧作为 reference
-        last_frame = overlap_frames[-1:]
-        ref_latent = vae.encode(last_frame[:, :, :, :3])
-
+        # Build reference_latents from anchor_frame
+        ref_latent = vae.encode(anchor_frame[:, :, :, :3])
         ref_latents = [ref_latent]
         if end_latent_cached is not None:
             ref_latents.append(end_latent_cached)
@@ -236,23 +234,150 @@ class PainterI2VExtend(io.ComfyNode):
             append=True,
         )
 
-        # === 11. 添加 reference_motion ===
-        if reference_video is not None:
-            ref_motion_latent = extract_reference_motion(
-                vae, reference_video, width, height, length
-            )
+        # Apply clip_vision if provided
+        if clip_vision is not None:
             positive = node_helpers.conditioning_set_values(
-                positive, {"reference_motion": ref_motion_latent}
+                positive, {"clip_vision_output": clip_vision}
             )
-            negative = node_helpers.conditioning_set_values(
-                negative, {"reference_motion": ref_motion_latent}
-            )
-
-        # === 12. 添加 clip_vision ===
-        clip_vision_output = merge_clip_vision_outputs(
-            clip_vision_start, clip_vision_end
-        )
-        positive, negative = apply_clip_vision(clip_vision_output, positive, negative)
 
         out_latent = {"samples": latent}
         return io.NodeOutput(positive, negative, out_latent)
+
+    @classmethod
+    def _build_continuity_mode(
+        cls,
+        vae,
+        previous_video,
+        overlap_frames,
+        end_latent_cached,
+        has_end,
+        width,
+        height,
+        length,
+        latent_t,
+        H,
+        W,
+        device,
+    ):
+        """
+        CONTINUITY mode: Start-middle frame linking.
+
+        - start = previous_video[-overlap_frames] at position 0
+        - middle = previous_video[-1] at position overlap_frames
+        - Auto-calculated middle_strength
+        """
+        middle_idx = overlap_frames
+
+        # Extract start and middle frames
+        start_image = previous_video[-overlap_frames : -overlap_frames + 1].clone()
+        middle_image = previous_video[-1:].clone()
+
+        # Resize to target dimensions
+        start_image = comfy.utils.common_upscale(
+            start_image.movedim(-1, 1), width, height, "bilinear", "center"
+        ).movedim(1, -1)
+
+        middle_image = comfy.utils.common_upscale(
+            middle_image.movedim(-1, 1), width, height, "bilinear", "center"
+        ).movedim(1, -1)
+
+        # Build image tensor: gray fill with start and middle frames
+        image = torch.ones((length, height, width, 3), device=device) * 0.5
+        image[0:1] = start_image[:, :, :, :3].to(device)
+        image[middle_idx : middle_idx + 1] = middle_image[:, :, :, :3].to(device)
+
+        # Encode to latent
+        concat_latent = vae.encode(image)
+
+        # Inject end_latent if provided
+        if has_end and end_latent_cached is not None:
+            concat_latent[:, :, -1:] = end_latent_cached
+
+        # Build mask
+        mask = torch.ones((1, 1, latent_t, H, W), device=device)
+
+        # Lock start frame (latent frame 0)
+        mask[:, :, 0:1] = 0.0
+
+        # Lock middle frame with auto-calculated strength
+        middle_latent_idx = middle_idx // 4
+        middle_strength = overlap_frames * 0.025  # Auto-calculate
+        middle_lock = max(0.0, 1.0 - middle_strength)
+        if middle_latent_idx < latent_t:
+            mask[:, :, middle_latent_idx : middle_latent_idx + 1] = middle_lock
+
+        # Lock end frame if provided
+        if has_end:
+            mask[:, :, -1:] = 0.0
+
+        return concat_latent, mask
+
+    @classmethod
+    def _build_svi_mode(
+        cls,
+        vae,
+        previous_video,
+        anchor_frame,
+        overlap_frames,
+        end_latent_cached,
+        has_end,
+        width,
+        height,
+        length,
+        latent_t,
+        latent_channels,
+        spacial_scale,
+        H,
+        W,
+        device,
+    ):
+        """
+        SVI mode: SVI 2.0 Pro architecture.
+
+        concat_latent = [anchor_latent, motion_latent, zero_padding]
+        - anchor = anchor_image or previous_video[0]
+        - motion = previous_video[-overlap_frames:] encoded
+        - padding = latents_mean (zero-valued latent)
+        """
+        # Get SVI padding (latents_mean)
+        concat_latent = get_svi_padding_latent(
+            batch_size=1,
+            latent_channels=latent_channels,
+            latent_frames=latent_t,
+            height=height,
+            width=width,
+            spacial_scale=spacial_scale,
+            device=device,
+        )
+
+        # Encode anchor frame
+        anchor_latent = vae.encode(anchor_frame[:, :, :, :3])
+
+        # Extract and encode motion frames
+        motion_frames = previous_video[-overlap_frames:].clone()
+        motion_frames = comfy.utils.common_upscale(
+            motion_frames.movedim(-1, 1), width, height, "bilinear", "center"
+        ).movedim(1, -1)
+        motion_latent = vae.encode(motion_frames[:, :, :, :3])
+        motion_latent_count = motion_latent.shape[2]
+
+        # Insert anchor at position 0
+        concat_latent[:, :, :1] = anchor_latent
+
+        # Insert motion_latent at position 1+
+        motion_end = min(1 + motion_latent_count, latent_t)
+        concat_latent[:, :, 1:motion_end] = motion_latent[:, :, : motion_end - 1]
+
+        # Insert end_latent if provided
+        if has_end and end_latent_cached is not None:
+            concat_latent[:, :, -1:] = end_latent_cached
+
+        # Build mask: only lock anchor (position 0)
+        mask = torch.ones((1, 1, latent_t, H, W), device=device)
+        mask[:, :, :1] = 0.0  # Lock anchor
+
+        # Lock end frame if provided
+        if has_end:
+            mask[:, :, -1:] = 0.0
+
+        return concat_latent, mask
