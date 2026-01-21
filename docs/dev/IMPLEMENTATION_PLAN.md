@@ -242,6 +242,7 @@ motion_latent = previous_encoded[:, :, -context_latent_count:]
 | length | INT | 81 | 生成帧数 |
 | motion_amplitude | FLOAT | 1.15 | 动作幅度增强（仅高噪） |
 | motion_latent_count | INT | 1 | 从 previous_latent 末端取多少帧 |
+| high_noise_end_strength | FLOAT | 1.0 | 高噪尾帧锁定强度（1.0=硬锁） |
 | correct_strength | FLOAT | 0.01 | 色彩校正强度 |
 | color_protect | BOOLEAN | True | 启用色彩保护（仅高噪） |
 | svi_mode | BOOLEAN | False | SVI LoRA 兼容模式 |
@@ -251,8 +252,8 @@ motion_latent = previous_encoded[:, :, -context_latent_count:]
 | 参数 | 类型 | 说明 |
 |------|------|------|
 | start_image | IMAGE | 首帧（被 previous_latent 覆盖） |
-| end_image | IMAGE | 尾帧 |
-| clip_vision | CLIP_VISION_OUTPUT | 语义引导 |
+| end_image | IMAGE | 尾帧（仅高噪使用） |
+| clip_vision | CLIP_VISION_OUTPUT | 语义引导（仅低噪使用） |
 | previous_latent | LATENT | 前置 latent（无损续接） |
 | reference_latent | LATENT | 外部风格参考（低噪优先使用） |
 
@@ -266,65 +267,100 @@ motion_latent = previous_encoded[:, :, -context_latent_count:]
 
 ### 核心设计
 
-#### 1. concat_latent 构建
+#### 1. concat_latent 内容分离
+
+| 阶段 | concat_latent 内容 | 说明 |
+|------|-------------------|------|
+| **高噪** | 首帧 + 尾帧 + 填充 | 完整锚点引导 |
+| **低噪** | 首帧 + 填充（无尾帧） | 只锁定首帧 |
 
 **标准模式 (svi_mode=False)**：
 ```python
-# 初始生成：灰色填充 + 锚点图像
-image = gray_fill(length)
-image[0] = start_image
-image[-1] = end_image
-concat_latent = vae.encode(image)
+# 高噪 concat
+concat_high = vae.encode(gray_fill_with_start_end)
 
-# 视频延续：注入 motion latent
-motion_latent = previous_latent[:, :, -motion_latent_count:]
-concat_latent[:, :, :motion_latent_count] = motion_latent
+# 低噪 concat
+concat_low = vae.encode(gray_fill_with_start_only)
 ```
 
 **SVI 模式 (svi_mode=True)**：
 ```python
-# 初始生成：零填充 + anchor
-concat_latent = get_svi_padding_latent()  # latents_mean
-concat_latent[:, :, :1] = start_latent
+# 高噪 concat
+concat_high = get_svi_padding_latent()
+concat_high[:, :, :1] = start_latent
+concat_high[:, :, -1:] = end_latent  # 如有
 
-# 视频延续：[anchor, motion, padding]
-anchor = previous_latent[:, :, :1]
-motion = previous_latent[:, :, -motion_latent_count:]
-concat_latent[:, :, :1] = anchor
-concat_latent[:, :, 1:1+motion_latent_count] = motion
+# 低噪 concat
+concat_low = get_svi_padding_latent()
+concat_low[:, :, :1] = start_latent
+# 不放 end_latent
 ```
 
-#### 2. mask 策略（高/低噪共用）
+**视频延续时**：
+```python
+# previous_latent 覆盖首帧
+motion_latent = previous_latent[:, :, -motion_latent_count:]
+concat_high[:, :, :motion_latent_count] = motion_latent
+concat_low[:, :, :motion_latent_count] = motion_latent
+```
 
-| 区域 | mask 值 | 说明 |
-|------|---------|------|
-| 首帧 | 0.0 | 硬锁定 |
-| motion 区域 | 1.0 | 软锁定（仅 concat_latent 注入） |
-| 尾帧 | 0.0 | 硬锁定（如有 end_image） |
-| 其他 | 1.0 | 自由生成 |
+#### 2. mask 策略（高/低噪分离）
 
-#### 3. 高/低噪分离
+| 区域 | 高噪 mask | 低噪 mask | 说明 |
+|------|-----------|-----------|------|
+| 首帧 | 0.0 | 0.0 | 硬锁定（确保首帧与输入一致） |
+| 尾帧 | 1.0 - high_noise_end_strength | 1.0 | 高噪可配置，低噪不锁定 |
+| motion 区域 | 1.0 | 1.0 | 软锁定（仅 concat 注入） |
+| 其他 | 1.0 | 1.0 | 自由生成 |
+
+#### 3. 高/低噪分离总结
 
 | 组件 | 高噪 | 低噪 |
 |------|------|------|
-| concat_latent | 增强版（motion_amplitude + color_protect） | 原始版 |
-| mask | 共用 | 共用 |
+| concat_latent | 首帧 + 尾帧 + motion_amplitude 增强 | 首帧 only（原始版） |
+| mask | 首帧硬锁 + 尾帧可配置强度 | 首帧硬锁 only |
+| clip_vision | ❌ 不使用 | ✅ 使用 |
+| negative | 跟随高噪 concat/mask | 跟随低噪 concat/mask |
 | reference_latent | 自动生成（start + end） | 外部优先，无则复用高噪 |
 
 #### 4. 处理流程
 
 ```
-concat_latent = build_based_on_mode()
-    ↓
+# 构建高噪 concat（首帧 + 尾帧）
+concat_high = build_with_start_and_end()
 inject_motion_latent() (if previous_latent)
-    ↓
-concat_latent_original = clone()  ────────→ 低噪
-    ↓
 apply_motion_amplitude() (if > 1.0)
-    ↓
 apply_color_protect() (if enabled)
-    ↓
-concat_latent_enhanced  ──────────────────→ 高噪
+
+# 构建低噪 concat（首帧 only）
+concat_low = build_with_start_only()
+inject_motion_latent() (if previous_latent)  # motion 部分共享
+
+# 构建 mask
+mask_high[:, :, :1] = 0.0
+mask_high[:, :, -1:] = 1.0 - high_noise_end_strength  # 可配置
+
+mask_low[:, :, :1] = 0.0
+# 其他都是 1.0
+```
+
+#### 5. conditioning 分离规则
+
+```python
+# 高噪
+positive_high = {concat_latent: concat_high, mask: mask_high}
+negative_high = {concat_latent: concat_high, mask: mask_high}
+
+# 低噪
+positive_low = {concat_latent: concat_low, mask: mask_low, clip_vision: ✅}
+negative_low = {concat_latent: concat_low, mask: mask_low, clip_vision: ✅}
+
+# reference_latent
+positive_high["reference_latents"] = [start_latent, end_latent]
+negative_high["reference_latents"] = [zeros_like...]
+
+positive_low["reference_latents"] = external_ref or [start_latent]
+negative_low["reference_latents"] = [zeros_like...]
 ```
 
 ### 来源整合
@@ -337,8 +373,11 @@ concat_latent_enhanced  ──────────────────�
 
 1. **4 cond 输出**：需配合 PainterSamplerAdvanced
 2. **previous_latent 覆盖 start_image**：续接场景下 start_image 被忽略
-3. **无需 context_latent_count**：直接从 previous_latent 末端获取
-4. **SVI 模式差异**：使用 [anchor, motion, padding] 结构
+3. **concat_latent 内容分离**：高噪有尾帧，低噪无尾帧
+4. **mask 分离**：高噪锁定首尾，低噪只锁定首帧
+5. **CLIP Vision 只低噪**：避免语义信息干扰高噪运动生成
+6. **negative 跟随 positive**：各自使用对应阶段的 concat/mask
+7. **首帧硬锁定**：确保输出首帧与输入完全一致
 
 ---
 

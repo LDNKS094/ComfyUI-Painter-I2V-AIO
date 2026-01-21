@@ -2,17 +2,11 @@
 """
 PainterI2V Advanced - Full-featured Video Conditioning Node
 
-Covers all scenarios from PainterI2V and PainterI2VExtend with high/low noise separation:
-- Standard mode initial generation (I2V/FLF2V)
-- Standard mode video continuation (motion latent injection)
-- SVI mode initial generation (zero padding + anchor)
-- SVI mode video continuation (anchor + motion from previous_latent)
+High/Low noise separation with different concat_latent content:
+- High noise: start + end frame, motion_amplitude enhanced
+- Low noise: start frame only, original version
 
-High/Low noise separation:
-- High noise: motion_amplitude + color_protect applied
-- Low noise: original concat_latent preserved
-
-SOURCE TRACKING: Based on PainterI2VAdvanced + Wan22FMLF SVI
+Covers all scenarios from PainterI2V and PainterI2VExtend.
 """
 
 import torch
@@ -24,25 +18,12 @@ from comfy_api.latest import io
 from ..common.utils import (
     apply_motion_amplitude,
     apply_color_protect,
-    apply_frequency_separation,
     apply_clip_vision,
     get_svi_padding_latent,
 )
 
 
 class PainterI2VAdvanced(io.ComfyNode):
-    """
-    Advanced Wan2.2 Video Conditioning Node with 4-cond output.
-
-    Scenarios:
-    - Initial generation: start_image → I2V, start+end → FLF2V
-    - Video continuation: previous_latent → motion latent injection
-
-    Modes:
-    - Standard (svi_mode=False): Gray padding, motion amplitude enhancement
-    - SVI (svi_mode=True): Zero padding (latents_mean), SVI 2.0 Pro structure
-    """
-
     @classmethod
     def define_schema(cls):
         return io.Schema(
@@ -50,11 +31,9 @@ class PainterI2VAdvanced(io.ComfyNode):
             display_name="Painter I2V Advanced",
             category="conditioning/video_models",
             inputs=[
-                # Core connections
                 io.Conditioning.Input("positive"),
                 io.Conditioning.Input("negative"),
                 io.Vae.Input("vae"),
-                # Node controls
                 io.Int.Input("width", default=832, min=16, max=4096, step=16),
                 io.Int.Input("height", default=480, min=16, max=4096, step=16),
                 io.Int.Input("length", default=81, min=1, max=4096, step=4),
@@ -72,7 +51,15 @@ class PainterI2VAdvanced(io.ComfyNode):
                     min=1,
                     max=11,
                     step=1,
-                    tooltip="Number of latent frames to extract from previous_latent end.",
+                    tooltip="Latent frames to extract from previous_latent end.",
+                ),
+                io.Float.Input(
+                    "high_noise_end_strength",
+                    default=1.0,
+                    min=0.0,
+                    max=1.0,
+                    step=0.05,
+                    tooltip="End frame lock strength for high noise (1.0=hard lock).",
                 ),
                 io.Float.Input(
                     "correct_strength",
@@ -80,7 +67,7 @@ class PainterI2VAdvanced(io.ComfyNode):
                     min=0.0,
                     max=0.3,
                     step=0.01,
-                    tooltip="Color correction strength for color_protect.",
+                    tooltip="Color correction strength.",
                 ),
                 io.Boolean.Input(
                     "color_protect",
@@ -92,23 +79,26 @@ class PainterI2VAdvanced(io.ComfyNode):
                     default=False,
                     tooltip="Enable SVI mode for SVI LoRA compatibility.",
                 ),
-                # Optional connections
                 io.Image.Input("start_image", optional=True),
-                io.Image.Input("end_image", optional=True),
+                io.Image.Input(
+                    "end_image",
+                    optional=True,
+                    tooltip="End frame (high noise only).",
+                ),
                 io.ClipVisionOutput.Input(
                     "clip_vision",
                     optional=True,
-                    tooltip="CLIP vision output for semantic guidance.",
+                    tooltip="CLIP vision (low noise only).",
                 ),
                 io.Latent.Input(
                     "previous_latent",
                     optional=True,
-                    tooltip="Previous video latent for continuation. Overrides start_image.",
+                    tooltip="Previous video latent for continuation.",
                 ),
                 io.Latent.Input(
                     "reference_latent",
                     optional=True,
-                    tooltip="External reference latent for low noise phase.",
+                    tooltip="External reference latent (low noise priority).",
                 ),
             ],
             outputs=[
@@ -131,6 +121,7 @@ class PainterI2VAdvanced(io.ComfyNode):
         length,
         motion_amplitude=1.15,
         motion_latent_count=1,
+        high_noise_end_strength=1.0,
         correct_strength=0.01,
         color_protect=True,
         svi_mode=False,
@@ -147,207 +138,237 @@ class PainterI2VAdvanced(io.ComfyNode):
         H = height // spacial_scale
         W = width // spacial_scale
 
-        # === 1. Initialize output latent ===
         latent = torch.zeros([1, latent_channels, latent_t, H, W], device=device)
 
-        # === 2. Preprocess images and cache latents ===
         has_start = start_image is not None
         has_end = end_image is not None
         has_previous = previous_latent is not None
-        anchor_start = False
-        anchor_end = False
+
         start_latent_cached = None
         end_latent_cached = None
+        motion_latent = None
+        actual_motion_count = 0
 
         if has_start:
             start_image = comfy.utils.common_upscale(
                 start_image[:1].movedim(-1, 1), width, height, "bilinear", "center"
             ).movedim(1, -1)
             start_latent_cached = vae.encode(start_image[:, :, :, :3])
-            anchor_start = True
 
         if has_end:
             end_image = comfy.utils.common_upscale(
                 end_image[-1:].movedim(-1, 1), width, height, "bilinear", "center"
             ).movedim(1, -1)
             end_latent_cached = vae.encode(end_image[:, :, :, :3])
-            anchor_end = True
 
-        # === 3. Handle previous_latent (overrides start_image) ===
         if has_previous:
             prev_samples = previous_latent["samples"]
-            # Clamp motion_latent_count to available frames
             actual_motion_count = min(motion_latent_count, prev_samples.shape[2])
             motion_latent = prev_samples[:, :, -actual_motion_count:].clone()
-            # Use first frame of previous_latent as anchor reference
-            anchor_latent = prev_samples[:, :, :1].clone()
-            anchor_start = True
-            # Override start_latent_cached with last frame of previous
             start_latent_cached = prev_samples[:, :, -1:].clone()
+            has_start = True
 
-        # === 4. Build concat_latent based on mode ===
         if svi_mode:
-            # SVI mode: zero padding (latents_mean)
-            concat_latent = get_svi_padding_latent(
-                batch_size=1,
+            concat_high, concat_low = cls._build_svi_mode(
+                start_latent=start_latent_cached,
+                end_latent=end_latent_cached,
+                motion_latent=motion_latent,
+                actual_motion_count=actual_motion_count,
+                has_end=has_end,
+                latent_t=latent_t,
                 latent_channels=latent_channels,
-                latent_frames=latent_t,
+                H=H,
+                W=W,
+                spacial_scale=spacial_scale,
                 height=height,
                 width=width,
-                spacial_scale=spacial_scale,
+                device=device,
+            )
+        else:
+            concat_high, concat_low = cls._build_standard_mode(
+                vae=vae,
+                start_image=start_image if not has_previous else None,
+                end_image=end_image,
+                start_latent=start_latent_cached,
+                end_latent=end_latent_cached,
+                motion_latent=motion_latent,
+                actual_motion_count=actual_motion_count,
+                has_start=has_start,
+                has_end=has_end,
+                has_previous=has_previous,
+                length=length,
+                height=height,
+                width=width,
                 device=device,
             )
 
-            if has_previous:
-                # SVI continuation: [anchor, motion, padding]
-                # Anchor at position 0
-                concat_latent[:, :, :1] = anchor_latent
-                # Motion latent at position 1+
-                motion_end = min(1 + actual_motion_count, latent_t)
-                concat_latent[:, :, 1:motion_end] = motion_latent[
-                    :, :, : motion_end - 1
-                ]
-            elif anchor_start and start_latent_cached is not None:
-                # SVI initial: anchor only
-                concat_latent[:, :, :1] = start_latent_cached
+        concat_high_original = concat_high.clone()
 
-            # End frame
-            if anchor_end and end_latent_cached is not None:
-                concat_latent[:, :, -1:] = end_latent_cached
-        else:
-            # Standard mode: gray padding
-            image = torch.ones((length, height, width, 3), device=device) * 0.5
-
-            if has_previous:
-                # Standard continuation: motion latent injection (handled after encoding)
-                pass
-            elif anchor_start:
-                image[0] = start_image[0, :, :, :3]
-
-            if anchor_end:
-                image[-1] = end_image[0, :, :, :3]
-
-            concat_latent = vae.encode(image)
-
-            # Inject motion latent for continuation
-            if has_previous:
-                concat_latent[:, :, :actual_motion_count] = motion_latent
-
-        # === 5. Save original for low noise ===
-        concat_latent_original = concat_latent.clone()
-
-        # === 6. Build mask (shared by high/low noise) ===
-        mask = torch.ones((1, 1, latent_t, H, W), device=device)
-
-        # Lock first frame
-        if anchor_start or has_previous:
-            mask[:, :, :1] = 0.0
-
-        # Lock end frame
-        if anchor_end:
-            mask[:, :, -1:] = 0.0
-
-        # Motion latent region: soft lock (mask=1.0, default)
-
-        # === 7. Apply motion_amplitude (high noise only) ===
         if motion_amplitude > 1.0:
-            if has_start and has_end and not has_previous:
-                # FLF2V mode: frequency separation
-                start_l = concat_latent[:, :, 0:1]
-                end_l = concat_latent[:, :, -1:]
-                t = torch.linspace(0.0, 1.0, latent_t, device=device)
-                t = t.view(1, 1, -1, 1, 1)
-                linear_latent = start_l * (1 - t) + end_l * t
+            concat_high = apply_motion_amplitude(
+                concat_high,
+                base_frame_idx=0,
+                amplitude=motion_amplitude,
+                protect_brightness=True,
+            )
 
-                if length > 2:
-                    boost_scale = (motion_amplitude - 1.0) * 4.0
-                    concat_latent = apply_frequency_separation(
-                        concat_latent,
-                        linear_latent,
-                        boost_scale,
-                        latent_channels=latent_channels,
-                    )
-            else:
-                # I2V / continuation mode: simple amplitude boost
-                concat_latent = apply_motion_amplitude(
-                    concat_latent,
-                    base_frame_idx=0,
-                    amplitude=motion_amplitude,
-                    protect_brightness=True,
-                )
-
-            # === 8. Apply color_protect (high noise only) ===
             if color_protect and correct_strength > 0:
-                concat_latent = apply_color_protect(
-                    concat_latent, concat_latent_original, correct_strength
+                concat_high = apply_color_protect(
+                    concat_high, concat_high_original, correct_strength
                 )
 
-        # === 9. Build reference_latent ===
-        auto_refs = []
-        if start_latent_cached is not None:
-            auto_refs.append(start_latent_cached)
-        if end_latent_cached is not None:
-            auto_refs.append(end_latent_cached)
+        mask_high = torch.ones((1, 1, latent_t, H, W), device=device)
+        mask_low = torch.ones((1, 1, latent_t, H, W), device=device)
 
-        ref_latent_high = auto_refs
+        if has_start or has_previous:
+            mask_high[:, :, :1] = 0.0
+            mask_low[:, :, :1] = 0.0
 
-        # Low noise: prefer external input
-        if reference_latent is not None:
-            ref_latent_low = [reference_latent["samples"]]
-        else:
-            ref_latent_low = ref_latent_high  # Fallback to auto
+        if has_end:
+            mask_high[:, :, -1:] = max(0.0, 1.0 - high_noise_end_strength)
 
-        # === 10. Set conditioning ===
-        # High noise (enhanced)
         positive_high = node_helpers.conditioning_set_values(
-            positive,
-            {"concat_latent_image": concat_latent, "concat_mask": mask},
+            positive, {"concat_latent_image": concat_high, "concat_mask": mask_high}
         )
         negative_high = node_helpers.conditioning_set_values(
-            negative,
-            {"concat_latent_image": concat_latent, "concat_mask": mask},
+            negative, {"concat_latent_image": concat_high, "concat_mask": mask_high}
         )
 
-        # Low noise (original)
         positive_low = node_helpers.conditioning_set_values(
-            positive,
-            {"concat_latent_image": concat_latent_original, "concat_mask": mask},
+            positive, {"concat_latent_image": concat_low, "concat_mask": mask_low}
         )
         negative_low = node_helpers.conditioning_set_values(
-            negative,
-            {"concat_latent_image": concat_latent_original, "concat_mask": mask},
+            negative, {"concat_latent_image": concat_low, "concat_mask": mask_low}
         )
 
-        # Add reference_latent
-        if ref_latent_high:
+        ref_high = []
+        if start_latent_cached is not None:
+            ref_high.append(start_latent_cached)
+        if end_latent_cached is not None:
+            ref_high.append(end_latent_cached)
+
+        if reference_latent is not None:
+            ref_low = [reference_latent["samples"]]
+        elif start_latent_cached is not None:
+            ref_low = [start_latent_cached]
+        else:
+            ref_low = ref_high
+
+        if ref_high:
             positive_high = node_helpers.conditioning_set_values(
-                positive_high, {"reference_latents": ref_latent_high}, append=True
+                positive_high, {"reference_latents": ref_high}, append=True
             )
             negative_high = node_helpers.conditioning_set_values(
                 negative_high,
-                {"reference_latents": [torch.zeros_like(r) for r in ref_latent_high]},
+                {"reference_latents": [torch.zeros_like(r) for r in ref_high]},
                 append=True,
             )
 
-        if ref_latent_low:
+        if ref_low:
             positive_low = node_helpers.conditioning_set_values(
-                positive_low, {"reference_latents": ref_latent_low}, append=True
+                positive_low, {"reference_latents": ref_low}, append=True
             )
             negative_low = node_helpers.conditioning_set_values(
                 negative_low,
-                {"reference_latents": [torch.zeros_like(r) for r in ref_latent_low]},
+                {"reference_latents": [torch.zeros_like(r) for r in ref_low]},
                 append=True,
             )
 
-        # === 11. Add clip_vision ===
-        positive_high, negative_high = apply_clip_vision(
-            clip_vision, positive_high, negative_high
-        )
-        positive_low, negative_low = apply_clip_vision(
-            clip_vision, positive_low, negative_low
-        )
+        if clip_vision is not None:
+            positive_low = node_helpers.conditioning_set_values(
+                positive_low, {"clip_vision_output": clip_vision}
+            )
+            negative_low = node_helpers.conditioning_set_values(
+                negative_low, {"clip_vision_output": clip_vision}
+            )
 
         out_latent = {"samples": latent}
         return io.NodeOutput(
             positive_high, negative_high, positive_low, negative_low, out_latent
         )
+
+    @classmethod
+    def _build_standard_mode(
+        cls,
+        vae,
+        start_image,
+        end_image,
+        start_latent,
+        end_latent,
+        motion_latent,
+        actual_motion_count,
+        has_start,
+        has_end,
+        has_previous,
+        length,
+        height,
+        width,
+        device,
+    ):
+        image_high = torch.ones((length, height, width, 3), device=device) * 0.5
+        image_low = torch.ones((length, height, width, 3), device=device) * 0.5
+
+        if start_image is not None and not has_previous:
+            image_high[0] = start_image[0, :, :, :3]
+            image_low[0] = start_image[0, :, :, :3]
+
+        if end_image is not None:
+            image_high[-1] = end_image[0, :, :, :3]
+
+        concat_high = vae.encode(image_high)
+        concat_low = vae.encode(image_low)
+
+        if motion_latent is not None:
+            concat_high[:, :, :actual_motion_count] = motion_latent
+            concat_low[:, :, :actual_motion_count] = motion_latent
+
+        return concat_high, concat_low
+
+    @classmethod
+    def _build_svi_mode(
+        cls,
+        start_latent,
+        end_latent,
+        motion_latent,
+        actual_motion_count,
+        has_end,
+        latent_t,
+        latent_channels,
+        H,
+        W,
+        spacial_scale,
+        height,
+        width,
+        device,
+    ):
+        concat_high = get_svi_padding_latent(
+            batch_size=1,
+            latent_channels=latent_channels,
+            latent_frames=latent_t,
+            height=height,
+            width=width,
+            spacial_scale=spacial_scale,
+            device=device,
+        )
+        concat_low = get_svi_padding_latent(
+            batch_size=1,
+            latent_channels=latent_channels,
+            latent_frames=latent_t,
+            height=height,
+            width=width,
+            spacial_scale=spacial_scale,
+            device=device,
+        )
+
+        if start_latent is not None:
+            concat_high[:, :, :1] = start_latent
+            concat_low[:, :, :1] = start_latent
+
+        if has_end and end_latent is not None:
+            concat_high[:, :, -1:] = end_latent
+
+        if motion_latent is not None:
+            concat_high[:, :, :actual_motion_count] = motion_latent
+            concat_low[:, :, :actual_motion_count] = motion_latent
+
+        return concat_high, concat_low
