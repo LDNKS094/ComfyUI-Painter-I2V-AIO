@@ -27,4 +27,5 @@ nul
 
 .*/
 ref/
+docs/dev
 pyrightconfig.json
