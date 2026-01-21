@@ -199,10 +199,8 @@ class PainterI2VAdvanced(io.ComfyNode):
         end_latent_cached = None
         motion_latent = None
         
-        # Convert pixel frames to latent frame index
+        # Convert pixel frames to latent frame index (for standard mode continuity)
         overlap_latent_idx = overlap_frames // 4
-        # Number of latent frames to extract (for SVI mode motion context)
-        overlap_latent_count = ((overlap_frames - 1) // 4) + 1
 
         if has_start:
             start_image = comfy.utils.common_upscale(
@@ -218,12 +216,11 @@ class PainterI2VAdvanced(io.ComfyNode):
             ).movedim(1, -1)
             end_latent_cached = vae.encode(end_image[:, :, :, :3])
 
-        # For SVI mode: extract motion_latent from previous_latent
+        # For SVI mode: extract motion_latent from previous_latent (last 1 frame only per SVI 2.0 Pro spec)
         if svi_mode and has_previous_latent:
             prev_samples = previous_latent["samples"]
-            actual_count = min(overlap_latent_count, prev_samples.shape[2])
-            motion_latent = prev_samples[:, :, -actual_count:].clone()
-            start_latent_cached = motion_latent[:, :, :1].clone()
+            motion_latent = prev_samples[:, :, -1:].clone()
+            start_latent_cached = motion_latent.clone()
             has_start = True
 
         if svi_mode:
@@ -231,7 +228,6 @@ class PainterI2VAdvanced(io.ComfyNode):
                 start_latent=start_latent_cached,
                 end_latent=end_latent_cached,
                 motion_latent=motion_latent,
-                overlap_latent_count=overlap_latent_count,
                 has_end=has_end,
                 latent_t=latent_t,
                 latent_channels=latent_channels,
@@ -405,7 +401,6 @@ class PainterI2VAdvanced(io.ComfyNode):
         start_latent,
         end_latent,
         motion_latent,
-        overlap_latent_count,
         has_end,
         latent_t,
         latent_channels,
@@ -416,6 +411,14 @@ class PainterI2VAdvanced(io.ComfyNode):
         width,
         device,
     ):
+        """
+        SVI 2.0 Pro mode.
+        
+        concat_latent = [anchor_latent, motion_latent, zero_padding]
+        - anchor = start_latent (from start_image or previous)
+        - motion = last 1 latent frame only (per SVI 2.0 Pro spec)
+        - padding = latents_mean (zero-valued latent)
+        """
         concat_high = get_svi_padding_latent(
             batch_size=1,
             latent_channels=latent_channels,
@@ -435,15 +438,18 @@ class PainterI2VAdvanced(io.ComfyNode):
             device=device,
         )
 
+        # Position 0: anchor_latent
         if start_latent is not None:
             concat_high[:, :, :1] = start_latent
             concat_low[:, :, :1] = start_latent
 
+        # Position 1: motion_latent (last 1 frame only per SVI 2.0 Pro spec)
+        if motion_latent is not None:
+            concat_high[:, :, 1:2] = motion_latent[:, :, -1:]
+            concat_low[:, :, 1:2] = motion_latent[:, :, -1:]
+
+        # End frame (high noise only)
         if has_end and end_latent is not None:
             concat_high[:, :, -1:] = end_latent
-
-        if motion_latent is not None:
-            concat_high[:, :, :overlap_latent_count] = motion_latent
-            concat_low[:, :, :overlap_latent_count] = motion_latent
 
         return concat_high, concat_low

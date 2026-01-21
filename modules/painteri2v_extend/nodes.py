@@ -135,7 +135,7 @@ class PainterI2VExtend(io.ComfyNode):
             [batch_size, latent_channels, latent_t, H, W], device=device
         )
 
-        # Validate overlap_frames
+        # Validate overlap_frames (only used in continuity mode)
         overlap_frames = min(overlap_frames, previous_video.shape[0] - 1, length - 4)
         overlap_frames = max(4, overlap_frames)
 
@@ -159,11 +159,11 @@ class PainterI2VExtend(io.ComfyNode):
             ).movedim(1, -1)
 
         if svi_mode:
+            # SVI 2.0 Pro: motion_latent is always last 1 frame only
             concat_latent, mask = cls._build_svi_mode(
                 vae=vae,
                 previous_video=previous_video,
                 anchor_frame=anchor_frame,
-                overlap_frames=overlap_frames,
                 end_latent_cached=end_latent_cached,
                 has_end=has_end,
                 width=width,
@@ -317,7 +317,6 @@ class PainterI2VExtend(io.ComfyNode):
         vae,
         previous_video,
         anchor_frame,
-        overlap_frames,
         end_latent_cached,
         has_end,
         width,
@@ -329,14 +328,13 @@ class PainterI2VExtend(io.ComfyNode):
         H,
         W,
         device,
-        context_latents=11,
     ):
         """
-        SVI mode: SVI 2.0 Pro architecture.
+        SVI 2.0 Pro mode.
 
         concat_latent = [anchor_latent, motion_latent, zero_padding]
         - anchor = anchor_image or previous_video[0]
-        - motion = last N latent frames from encoded previous_video
+        - motion = last 1 latent frame only (per SVI 2.0 Pro spec)
         - padding = latents_mean (zero-valued latent)
         """
         concat_latent = get_svi_padding_latent(
@@ -349,33 +347,24 @@ class PainterI2VExtend(io.ComfyNode):
             device=device,
         )
 
+        # Position 0: anchor_latent
         anchor_latent = vae.encode(anchor_frame[:, :, :, :3])
-
-        max_pixel_frames = (context_latents - 1) * 4 + 1
-        available_frames = previous_video.shape[0]
-        if available_frames < max_pixel_frames:
-            actual_latents = ((available_frames - 1) // 4) + 1
-            max_pixel_frames = (actual_latents - 1) * 4 + 1
-
-        prev_video_truncated = previous_video[-max_pixel_frames:]
-
-        prev_video_resized = comfy.utils.common_upscale(
-            prev_video_truncated.movedim(-1, 1), width, height, "bilinear", "center"
-        ).movedim(1, -1)
-        prev_latent = vae.encode(prev_video_resized[:, :, :, :3])
-
-        motion_latent_count = ((overlap_frames - 1) // 4) + 1
-        motion_latent_count = min(motion_latent_count, prev_latent.shape[2])
-        motion_latent = prev_latent[:, :, -motion_latent_count:]
-
         concat_latent[:, :, :1] = anchor_latent
 
-        motion_end = min(1 + motion_latent_count, latent_t)
-        concat_latent[:, :, 1:motion_end] = motion_latent[:, :, : motion_end - 1]
+        # Position 1: motion_latent (last 1 frame only per SVI 2.0 Pro spec)
+        # Encode last frame of previous_video
+        last_frame = previous_video[-1:].clone()
+        last_frame_resized = comfy.utils.common_upscale(
+            last_frame.movedim(-1, 1), width, height, "bilinear", "center"
+        ).movedim(1, -1)
+        motion_latent = vae.encode(last_frame_resized[:, :, :, :3])
+        concat_latent[:, :, 1:2] = motion_latent
 
+        # End frame
         if has_end and end_latent_cached is not None:
             concat_latent[:, :, -1:] = end_latent_cached
 
+        # Mask: lock anchor only
         mask = torch.ones((1, 1, latent_t, H, W), device=device)
         mask[:, :, :1] = 0.0
 
