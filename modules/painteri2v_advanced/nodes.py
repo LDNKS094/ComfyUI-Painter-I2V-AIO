@@ -6,6 +6,11 @@ High/Low noise separation with different concat_latent content:
 - High noise: start + end frame, motion_amplitude enhanced
 - Low noise: start frame only, original version
 
+Loop-compatible design:
+- previous_latent accepts empty latent as fake input for ComfyUI loop
+- start_image: concat source (first gen) or reference only (continuation)
+- reference_latent: low noise only, from start_image encoding
+
 Covers all scenarios from PainterI2V and PainterI2VExtend.
 """
 
@@ -93,12 +98,7 @@ class PainterI2VAdvanced(io.ComfyNode):
                 io.Latent.Input(
                     "previous_latent",
                     optional=True,
-                    tooltip="Previous video latent for continuation.",
-                ),
-                io.Latent.Input(
-                    "reference_latent",
-                    optional=True,
-                    tooltip="External reference latent (low noise priority).",
+                    tooltip="Previous video latent for continuation. Accepts empty latent for loop compatibility.",
                 ),
             ],
             outputs=[
@@ -129,7 +129,6 @@ class PainterI2VAdvanced(io.ComfyNode):
         end_image=None,
         clip_vision=None,
         previous_latent=None,
-        reference_latent=None,
     ) -> io.NodeOutput:
         device = mm.intermediate_device()
         spacial_scale = vae.spacial_compression_encode()
@@ -142,8 +141,17 @@ class PainterI2VAdvanced(io.ComfyNode):
 
         has_start = start_image is not None
         has_end = end_image is not None
-        has_previous = previous_latent is not None
 
+        # Detect fake previous_latent (empty latent for loop compatibility)
+        has_previous = False
+        if previous_latent is not None:
+            prev_samples = previous_latent["samples"]
+            # Check if it's a real latent (has temporal frames)
+            if prev_samples.numel() > 0 and prev_samples.shape[2] > 0:
+                has_previous = True
+
+        # Cache for reference_latent (from start_image, used in low noise only)
+        start_image_latent_for_ref = None
         start_latent_cached = None
         end_latent_cached = None
         motion_latent = None
@@ -154,6 +162,8 @@ class PainterI2VAdvanced(io.ComfyNode):
                 start_image[:1].movedim(-1, 1), width, height, "bilinear", "center"
             ).movedim(1, -1)
             start_latent_cached = vae.encode(start_image[:, :, :, :3])
+            # Always cache for reference_latent (even in continuation mode)
+            start_image_latent_for_ref = start_latent_cached
 
         if has_end:
             end_image = comfy.utils.common_upscale(
@@ -241,36 +251,15 @@ class PainterI2VAdvanced(io.ComfyNode):
             negative, {"concat_latent_image": concat_low, "concat_mask": mask_low}
         )
 
-        ref_high = []
-        if start_latent_cached is not None:
-            ref_high.append(start_latent_cached)
-        if end_latent_cached is not None:
-            ref_high.append(end_latent_cached)
-
-        if reference_latent is not None:
-            ref_low = [reference_latent["samples"]]
-        elif start_latent_cached is not None:
-            ref_low = [start_latent_cached]
-        else:
-            ref_low = ref_high
-
-        if ref_high:
-            positive_high = node_helpers.conditioning_set_values(
-                positive_high, {"reference_latents": ref_high}, append=True
-            )
-            negative_high = node_helpers.conditioning_set_values(
-                negative_high,
-                {"reference_latents": [torch.zeros_like(r) for r in ref_high]},
-                append=True,
-            )
-
-        if ref_low:
+        if start_image_latent_for_ref is not None:
             positive_low = node_helpers.conditioning_set_values(
-                positive_low, {"reference_latents": ref_low}, append=True
+                positive_low,
+                {"reference_latents": [start_image_latent_for_ref]},
+                append=True,
             )
             negative_low = node_helpers.conditioning_set_values(
                 negative_low,
-                {"reference_latents": [torch.zeros_like(r) for r in ref_low]},
+                {"reference_latents": [torch.zeros_like(start_image_latent_for_ref)]},
                 append=True,
             )
 
