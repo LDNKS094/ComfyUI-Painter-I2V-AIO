@@ -9,7 +9,6 @@ from ..common.utils import (
     apply_motion_amplitude,
     apply_color_protect,
     apply_frequency_separation,
-    extract_reference_motion,
     apply_clip_vision,
     get_svi_padding_latent,
 )
@@ -59,11 +58,6 @@ class PainterI2V(io.ComfyNode):
                 ),
                 io.Image.Input("start_image", optional=True),
                 io.Image.Input("end_image", optional=True),
-                io.Image.Input(
-                    "reference_video",
-                    optional=True,
-                    tooltip="Optional reference video for motion guidance. Extracts reference_motion latent.",
-                ),
                 io.Boolean.Input(
                     "color_protect",
                     default=True,
@@ -97,7 +91,6 @@ class PainterI2V(io.ComfyNode):
         clip_vision=None,
         start_image=None,
         end_image=None,
-        reference_video=None,
         color_protect=True,
         svi_mode=False,
     ) -> io.NodeOutput:
@@ -234,19 +227,7 @@ class PainterI2V(io.ComfyNode):
                     append=True,
                 )
 
-        # === 10. 添加 reference_motion ===
-        if reference_video is not None:
-            ref_motion_latent = extract_reference_motion(
-                vae, reference_video, width, height, length
-            )
-            positive = node_helpers.conditioning_set_values(
-                positive, {"reference_motion": ref_motion_latent}
-            )
-            negative = node_helpers.conditioning_set_values(
-                negative, {"reference_motion": ref_motion_latent}
-            )
-
-        # === 11. 添加 clip_vision ===
+        # === 10. 添加 clip_vision ===
         positive, negative = apply_clip_vision(clip_vision, positive, negative)
 
         out_latent = {"samples": latent}
