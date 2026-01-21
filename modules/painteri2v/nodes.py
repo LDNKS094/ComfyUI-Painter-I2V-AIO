@@ -51,13 +51,13 @@ class PainterI2V(io.ComfyNode):
                     step=0.05,
                     tooltip="1.0 = Original, 1.15 = Recommended for I2V, up to 2.0 for high-speed motion",
                 ),
+                io.Image.Input("start_image", optional=True),
+                io.Image.Input("end_image", optional=True),
                 io.ClipVisionOutput.Input(
                     "clip_vision",
                     optional=True,
                     tooltip="CLIP vision output for semantic guidance.",
                 ),
-                io.Image.Input("start_image", optional=True),
-                io.Image.Input("end_image", optional=True),
                 io.Boolean.Input(
                     "color_protect",
                     default=True,
@@ -88,9 +88,9 @@ class PainterI2V(io.ComfyNode):
         length,
         batch_size,
         motion_amplitude,
-        clip_vision=None,
         start_image=None,
         end_image=None,
+        clip_vision=None,
         color_protect=True,
         svi_mode=False,
     ) -> io.NodeOutput:
