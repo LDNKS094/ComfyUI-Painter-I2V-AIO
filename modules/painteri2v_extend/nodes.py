@@ -52,16 +52,12 @@ class PainterI2VExtend(io.ComfyNode):
                 io.Int.Input("height", default=480, min=16, max=4096, step=16),
                 io.Int.Input("length", default=81, min=1, max=4096, step=4),
                 io.Int.Input("batch_size", default=1, min=1, max=4096),
-                io.Image.Input(
-                    "previous_video",
-                    tooltip="Previous video segment (required).",
-                ),
                 io.Int.Input(
                     "overlap_frames",
                     default=4,
                     min=4,
                     max=8,
-                    tooltip="Overlap frames for continuity. Controls start/middle positions (CONTINUITY) or motion frames (SVI).",
+                    tooltip="4-8 recommended. Standard mode only.",
                 ),
                 io.Float.Input(
                     "motion_amplitude",
@@ -69,33 +65,26 @@ class PainterI2VExtend(io.ComfyNode):
                     min=1.0,
                     max=2.0,
                     step=0.05,
-                    tooltip="Motion enhancement. Only applies in CONTINUITY mode.",
+                    tooltip="4-step LoRA fix. 1.1-1.2 normal, 1.2-1.5 fast. Standard mode only.",
                 ),
                 io.Boolean.Input(
                     "color_protect",
                     default=True,
-                    tooltip="Color drift protection. Only applies in CONTINUITY mode.",
+                    tooltip="Prevents color drift. Standard mode only.",
                 ),
                 io.Boolean.Input(
                     "svi_mode",
                     default=False,
-                    tooltip="Enable SVI mode for SVI LoRA compatibility.",
+                    tooltip="SVI LoRA mode. Uses anchor + last latent.",
                 ),
+                io.Image.Input("previous_video"),
                 io.Image.Input(
                     "anchor_image",
                     optional=True,
-                    tooltip="Style anchor + reference_latent source. Defaults to previous_video[0].",
+                    tooltip="Defaults to previous_video[0].",
                 ),
-                io.Image.Input(
-                    "end_image",
-                    optional=True,
-                    tooltip="Target end frame (locked).",
-                ),
-                io.ClipVisionOutput.Input(
-                    "clip_vision",
-                    optional=True,
-                    tooltip="CLIP vision output for semantic guidance.",
-                ),
+                io.Image.Input("end_image", optional=True),
+                io.ClipVisionOutput.Input("clip_vision", optional=True),
             ],
             outputs=[
                 io.Conditioning.Output(display_name="positive"),

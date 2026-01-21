@@ -42,28 +42,21 @@ class PainterI2VAdvanced(io.ComfyNode):
                 io.Int.Input("width", default=832, min=16, max=4096, step=16),
                 io.Int.Input("height", default=480, min=16, max=4096, step=16),
                 io.Int.Input("length", default=81, min=1, max=4096, step=4),
-                io.Float.Input(
-                    "motion_amplitude",
-                    default=1.15,
-                    min=1.0,
-                    max=2.0,
-                    step=0.05,
-                    tooltip=(
-                        "Motion enhancement multiplier (high noise only). "
-                        "Fixes slow-motion in 4-step LoRAs like lightx2v. "
-                        "Recommended: 1.0-1.1 (subtle), 1.1-1.2 (moderate), 1.2-1.5 (large motion)."
-                    ),
-                ),
                 io.Int.Input(
                     "overlap_frames",
                     default=4,
                     min=1,
                     max=41,
                     step=1,
-                    tooltip=(
-                        "Pixel frames to overlap for video continuation (standard mode only). "
-                        "Recommended: 4-8. Higher values = smoother transition but may reduce motion."
-                    ),
+                    tooltip="4-8 recommended. Standard mode only.",
+                ),
+                io.Float.Input(
+                    "motion_amplitude",
+                    default=1.15,
+                    min=1.0,
+                    max=2.0,
+                    step=0.05,
+                    tooltip="4-step LoRA fix. 1.1-1.2 normal, 1.2-1.5 fast. High noise only.",
                 ),
                 io.Float.Input(
                     "continuity_strength",
@@ -71,11 +64,7 @@ class PainterI2VAdvanced(io.ComfyNode):
                     min=0.0,
                     max=1.0,
                     step=0.05,
-                    tooltip=(
-                        "Motion frame lock strength in standard mode (0=free, 1=hard lock). "
-                        "Recommended: 0.1-0.2. Higher values enforce stricter continuity but may cause artifacts. "
-                        "Not used in SVI mode."
-                    ),
+                    tooltip="0.1-0.2 recommended. Standard mode only.",
                 ),
                 io.Float.Input(
                     "correct_strength",
@@ -83,69 +72,42 @@ class PainterI2VAdvanced(io.ComfyNode):
                     min=0.0,
                     max=0.3,
                     step=0.01,
-                    tooltip=(
-                        "Color drift correction strength after motion enhancement. "
-                        "Recommended: 0.01-0.05. Prevents green/dark color shift when motion_amplitude > 1.0."
-                    ),
+                    tooltip="0.01-0.05 recommended.",
                 ),
                 io.Boolean.Input(
                     "color_protect",
                     default=True,
-                    tooltip=(
-                        "Enable color drift protection (high noise only). "
-                        "Recommended: keep enabled to prevent color issues after motion enhancement."
-                    ),
+                    tooltip="Prevents color drift. High noise only.",
                 ),
                 io.Boolean.Input(
                     "svi_mode",
                     default=False,
-                    tooltip=(
-                        "Enable SVI 2.0 Pro mode for SVI LoRA compatibility. "
-                        "Uses latent-space continuation (anchor + motion). "
-                        "Disable for standard image-space continuation."
-                    ),
+                    tooltip="SVI LoRA mode. Uses latent-space continuation.",
                 ),
                 io.Image.Input(
                     "start_image",
                     optional=True,
-                    tooltip=(
-                        "First frame image. Used as concat source (first gen) or style anchor (continuation). "
-                        "Always provides reference_latent for low noise phase."
-                    ),
+                    tooltip="Also provides reference_latent for low noise.",
                 ),
                 io.Image.Input(
                     "end_image",
                     optional=True,
-                    tooltip=(
-                        "End frame target (high noise only). "
-                        "Enables first-last frame interpolation (FLF2V mode)."
-                    ),
+                    tooltip="High noise only.",
                 ),
                 io.ClipVisionOutput.Input(
                     "clip_vision",
                     optional=True,
-                    tooltip=(
-                        "CLIP vision embedding for semantic guidance (low noise only). "
-                        "Connect from WanImageEncode node."
-                    ),
+                    tooltip="Low noise only.",
                 ),
                 io.Latent.Input(
                     "previous_latent",
                     optional=True,
-                    tooltip=(
-                        "Previous video latent for continuation. "
-                        "Auto-converted to image for standard mode, used directly in SVI mode. "
-                        "Accepts empty latent for ComfyUI loop compatibility."
-                    ),
+                    tooltip="Auto-converts based on svi_mode. Supports empty latent for loop.",
                 ),
                 io.Image.Input(
                     "previous_image",
                     optional=True,
-                    tooltip=(
-                        "Previous video frames for continuation. "
-                        "Auto-converted to latent for SVI mode, used directly in standard mode. "
-                        "Cannot be used together with previous_latent."
-                    ),
+                    tooltip="Auto-converts based on svi_mode. Exclusive with previous_latent.",
                 ),
             ],
             outputs=[
