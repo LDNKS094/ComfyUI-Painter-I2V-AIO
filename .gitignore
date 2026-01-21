@@ -23,6 +23,8 @@ Thumbs.db
 
 AGENTS.md
 
+nul
+
 .*/
-docs/dev
+ref/
 pyrightconfig.json
