@@ -96,6 +96,14 @@ class PainterI2VExtend(io.ComfyNode):
                     optional=True,
                     tooltip="CLIP vision output for semantic guidance.",
                 ),
+                io.Int.Input(
+                    "debug_truncate_latents",
+                    default=21,
+                    min=2,
+                    max=41,
+                    optional=True,
+                    tooltip="[DEBUG] Max latent frames to encode from previous_video for SVI mode. 21 latents = 81 pixel frames.",
+                ),
             ],
             outputs=[
                 io.Conditioning.Output(display_name="positive"),
@@ -122,6 +130,7 @@ class PainterI2VExtend(io.ComfyNode):
         anchor_image=None,
         end_image=None,
         clip_vision=None,
+        debug_truncate_latents=21,
     ) -> io.NodeOutput:
         device = mm.intermediate_device()
         spacial_scale = vae.spacial_compression_encode()
@@ -159,12 +168,12 @@ class PainterI2VExtend(io.ComfyNode):
             ).movedim(1, -1)
 
         if svi_mode:
-            # ===== SVI MODE =====
             concat_latent, mask = cls._build_svi_mode(
                 vae=vae,
                 previous_video=previous_video,
                 anchor_frame=anchor_frame,
                 overlap_frames=overlap_frames,
+                truncate_latents=debug_truncate_latents,
                 end_latent_cached=end_latent_cached,
                 has_end=has_end,
                 width=width,
@@ -177,7 +186,7 @@ class PainterI2VExtend(io.ComfyNode):
                 W=W,
                 device=device,
             )
-            concat_latent_original = concat_latent  # No enhancement in SVI mode
+            concat_latent_original = concat_latent
         else:
             # ===== CONTINUITY MODE =====
             concat_latent, mask = cls._build_continuity_mode(
@@ -319,6 +328,7 @@ class PainterI2VExtend(io.ComfyNode):
         previous_video,
         anchor_frame,
         overlap_frames,
+        truncate_latents,
         end_latent_cached,
         has_end,
         width,
@@ -339,7 +349,6 @@ class PainterI2VExtend(io.ComfyNode):
         - motion = last N latent frames from encoded previous_video
         - padding = latents_mean (zero-valued latent)
         """
-        # Get SVI padding (latents_mean)
         concat_latent = get_svi_padding_latent(
             batch_size=1,
             latent_channels=latent_channels,
@@ -350,36 +359,35 @@ class PainterI2VExtend(io.ComfyNode):
             device=device,
         )
 
-        # Encode anchor frame
         anchor_latent = vae.encode(anchor_frame[:, :, :, :3])
 
-        # Encode entire previous_video, then extract last N latent frames
+        # Truncate previous_video to max pixel frames based on truncate_latents
+        max_pixel_frames = (truncate_latents - 1) * 4 + 1
+        if previous_video.shape[0] > max_pixel_frames:
+            prev_video_truncated = previous_video[-max_pixel_frames:]
+        else:
+            prev_video_truncated = previous_video
+
         prev_video_resized = comfy.utils.common_upscale(
-            previous_video.movedim(-1, 1), width, height, "bilinear", "center"
+            prev_video_truncated.movedim(-1, 1), width, height, "bilinear", "center"
         ).movedim(1, -1)
         prev_latent = vae.encode(prev_video_resized[:, :, :, :3])
 
-        # Calculate motion_latent_count from overlap_frames (pixel frames -> latent frames)
         motion_latent_count = ((overlap_frames - 1) // 4) + 1
         motion_latent_count = min(motion_latent_count, prev_latent.shape[2])
         motion_latent = prev_latent[:, :, -motion_latent_count:]
 
-        # Insert anchor at position 0
         concat_latent[:, :, :1] = anchor_latent
 
-        # Insert motion_latent at position 1+
         motion_end = min(1 + motion_latent_count, latent_t)
         concat_latent[:, :, 1:motion_end] = motion_latent[:, :, : motion_end - 1]
 
-        # Insert end_latent if provided
         if has_end and end_latent_cached is not None:
             concat_latent[:, :, -1:] = end_latent_cached
 
-        # Build mask: only lock anchor (position 0)
         mask = torch.ones((1, 1, latent_t, H, W), device=device)
         mask[:, :, :1] = 0.0
 
-        # Lock end frame if provided
         if has_end:
             mask[:, :, -1:] = 0.0
 
