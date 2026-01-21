@@ -96,14 +96,6 @@ class PainterI2VExtend(io.ComfyNode):
                     optional=True,
                     tooltip="CLIP vision output for semantic guidance.",
                 ),
-                io.Int.Input(
-                    "debug_truncate_latents",
-                    default=21,
-                    min=2,
-                    max=41,
-                    optional=True,
-                    tooltip="[DEBUG] Max latent frames to encode from previous_video for SVI mode. 21 latents = 81 pixel frames.",
-                ),
             ],
             outputs=[
                 io.Conditioning.Output(display_name="positive"),
@@ -130,7 +122,6 @@ class PainterI2VExtend(io.ComfyNode):
         anchor_image=None,
         end_image=None,
         clip_vision=None,
-        debug_truncate_latents=21,
     ) -> io.NodeOutput:
         device = mm.intermediate_device()
         spacial_scale = vae.spacial_compression_encode()
@@ -173,7 +164,6 @@ class PainterI2VExtend(io.ComfyNode):
                 previous_video=previous_video,
                 anchor_frame=anchor_frame,
                 overlap_frames=overlap_frames,
-                truncate_latents=debug_truncate_latents,
                 end_latent_cached=end_latent_cached,
                 has_end=has_end,
                 width=width,
@@ -328,7 +318,6 @@ class PainterI2VExtend(io.ComfyNode):
         previous_video,
         anchor_frame,
         overlap_frames,
-        truncate_latents,
         end_latent_cached,
         has_end,
         width,
@@ -340,6 +329,7 @@ class PainterI2VExtend(io.ComfyNode):
         H,
         W,
         device,
+        context_latents=11,
     ):
         """
         SVI mode: SVI 2.0 Pro architecture.
@@ -361,12 +351,13 @@ class PainterI2VExtend(io.ComfyNode):
 
         anchor_latent = vae.encode(anchor_frame[:, :, :, :3])
 
-        # Truncate previous_video to max pixel frames based on truncate_latents
-        max_pixel_frames = (truncate_latents - 1) * 4 + 1
-        if previous_video.shape[0] > max_pixel_frames:
-            prev_video_truncated = previous_video[-max_pixel_frames:]
-        else:
-            prev_video_truncated = previous_video
+        max_pixel_frames = (context_latents - 1) * 4 + 1
+        available_frames = previous_video.shape[0]
+        if available_frames < max_pixel_frames:
+            actual_latents = ((available_frames - 1) // 4) + 1
+            max_pixel_frames = (actual_latents - 1) * 4 + 1
+
+        prev_video_truncated = previous_video[-max_pixel_frames:]
 
         prev_video_resized = comfy.utils.common_upscale(
             prev_video_truncated.movedim(-1, 1), width, height, "bilinear", "center"
