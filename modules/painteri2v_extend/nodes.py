@@ -65,12 +65,12 @@ class PainterI2VExtend(io.ComfyNode):
                     min=1.0,
                     max=2.0,
                     step=0.05,
-                    tooltip="4-step LoRA fix. 1.1-1.2 normal, 1.2-1.5 fast. Standard mode only.",
+                    tooltip="4-step LoRA fix. 1.1-1.2 normal, 1.2-1.5 fast.",
                 ),
                 io.Boolean.Input(
                     "color_protect",
                     default=True,
-                    tooltip="Prevents color drift. Standard mode only.",
+                    tooltip="Prevents color drift from motion enhancement.",
                 ),
                 io.Boolean.Input(
                     "svi_mode",
@@ -148,7 +148,6 @@ class PainterI2VExtend(io.ComfyNode):
             ).movedim(1, -1)
 
         if svi_mode:
-            # SVI 2.0 Pro: motion_latent is always last 1 frame only
             concat_latent, mask = cls._build_svi_mode(
                 vae=vae,
                 previous_video=previous_video,
@@ -165,9 +164,7 @@ class PainterI2VExtend(io.ComfyNode):
                 W=W,
                 device=device,
             )
-            concat_latent_original = concat_latent
         else:
-            # ===== CONTINUITY MODE =====
             concat_latent, mask = cls._build_continuity_mode(
                 vae=vae,
                 previous_video=previous_video,
@@ -182,19 +179,18 @@ class PainterI2VExtend(io.ComfyNode):
                 W=W,
                 device=device,
             )
-            concat_latent_original = concat_latent.clone()
 
-            # Apply motion_amplitude (CONTINUITY only)
-            if motion_amplitude > 1.0:
-                concat_latent = apply_motion_amplitude(
-                    concat_latent,
-                    base_frame_idx=0,  # Use start frame as base
-                    amplitude=motion_amplitude,
-                    protect_brightness=True,
-                )
+        # Apply motion_amplitude and color_protect (both modes)
+        concat_latent_original = concat_latent.clone()
+        if motion_amplitude > 1.0:
+            concat_latent = apply_motion_amplitude(
+                concat_latent,
+                base_frame_idx=0,
+                amplitude=motion_amplitude,
+                protect_brightness=True,
+            )
 
-            # Apply color_protect (CONTINUITY only)
-            if motion_amplitude > 1.0 and color_protect:
+            if color_protect:
                 concat_latent = apply_color_protect(
                     concat_latent, concat_latent_original
                 )
