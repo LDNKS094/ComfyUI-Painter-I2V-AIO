@@ -67,14 +67,6 @@ class PainterI2VAdvanced(io.ComfyNode):
                     tooltip="Motion frame lock strength in standard mode (0=no lock, 1=hard lock). Not used in SVI mode.",
                 ),
                 io.Float.Input(
-                    "high_noise_end_strength",
-                    default=1.0,
-                    min=0.0,
-                    max=1.0,
-                    step=0.05,
-                    tooltip="End frame lock strength for high noise (1.0=hard lock).",
-                ),
-                io.Float.Input(
                     "correct_strength",
                     default=0.01,
                     min=0.0,
@@ -135,7 +127,6 @@ class PainterI2VAdvanced(io.ComfyNode):
         motion_amplitude=1.15,
         overlap_frames=4,
         continuity_strength=0.1,
-        high_noise_end_strength=1.0,
         correct_strength=0.01,
         color_protect=True,
         svi_mode=False,
@@ -283,9 +274,9 @@ class PainterI2VAdvanced(io.ComfyNode):
             mask_high[:, :, overlap_latent_idx:overlap_latent_idx+1] = motion_lock
             mask_low[:, :, overlap_latent_idx:overlap_latent_idx+1] = motion_lock
 
-        # End frame lock (high noise only)
+        # End frame lock (high noise only, fixed at 0.8 strength)
         if has_end:
-            mask_high[:, :, -1:] = max(0.0, 1.0 - high_noise_end_strength)
+            mask_high[:, :, -1:] = 0.2  # 1.0 - 0.8 = 0.2
 
         positive_high = node_helpers.conditioning_set_values(
             positive, {"concat_latent_image": concat_high, "concat_mask": mask_high}
